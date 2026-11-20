@@ -13,8 +13,9 @@
   "devDependencies": {
     "esbuild": "^0.25.0",
     "linkedom": "^0.18.0",
+    "moment": "^2.31.0",
     "obsidian": "^1.10.0",
-    "typescript": "^5.7.0"
+    "typescript": "^6.0.3"
   },
   "dependencies": {
     "fflate": "^0.8.3"

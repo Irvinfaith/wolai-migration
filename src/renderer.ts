@@ -1,8 +1,9 @@
 import {
   Plugin, ItemView, Modal, Notice, Menu, MarkdownRenderer, MarkdownRenderChild, MarkdownView,
-  TFile, TFolder, normalizePath, parseYaml, stringifyYaml, setIcon, moment,
+  TFile, TFolder, normalizePath, parseYaml, stringifyYaml, setIcon, moment as obsidianMoment,
   type App, type MarkdownPostProcessorContext, type MarkdownSectionInformation, type WorkspaceLeaf,
 } from "obsidian";
+import type MomentFactory from "moment";
 import { isPageIcon, readImportIndex, restrictIndexToImports, validateIndexReferences, type ConvertedIndex, type IndexNode, type PageIcon } from "./core/import-index";
 import {
   readBlockObject, readColumns, readDatabaseForm, readImage, readProgress, readStyled, readTable,
@@ -11,6 +12,14 @@ import {
 import { cleanFileName } from "./core/file-name";
 import { errorMessage, isArray, isDomNode, isRecord, isString } from "./core/validation";
 import { columnLabel, openWorkbook } from "./core/xlsx-preview";
+
+// Obsidian exposes a callable Moment instance. TypeScript 6 treats the
+// namespace import in Obsidian's declarations as non-callable.
+function moment(input?: string, format?: string, strict?: boolean) {
+  const factory: unknown = obsidianMoment;
+  if (typeof factory !== "function") throw new Error("Obsidian 的日期 API 不可用");
+  return (factory as typeof MomentFactory)(input, format, strict);
+}
 
 interface PagePosition { expected: string; at: number }
 interface PageRange { expected: string; start: number; end: number }
