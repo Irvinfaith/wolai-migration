@@ -1,0 +1,10 @@
+node_modules/
+dist/
+main.js
+*.log
+release/
+*.zip
+tests/local/
+.obsidian/
+.env
+.DS_Store

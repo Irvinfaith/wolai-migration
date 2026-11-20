@@ -1,0 +1,23 @@
+name: 导入问题
+description: 报告 ZIP 导入、页面排版或链接错误
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: 插件、Obsidian 版本和操作系统
+      placeholder: Wolai Migration 0.1.0 / Obsidian 1.15.1 / macOS
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤和实际结果
+      description: 请用虚构数据或已脱敏的最小导出样例。可附相关迁移报告条目。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true

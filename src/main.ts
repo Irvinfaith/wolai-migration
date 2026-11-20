@@ -1,0 +1,115 @@
+import { Notice, parseYaml, stringifyYaml } from "obsidian";
+import { checkZipSize, ImportCancelledError, readZip } from "./core/archive";
+import { readDatabaseSupplement } from "./core/database-supplement";
+import { convertArchive, writeConverted, type ConvertedIndex, type ConvertResult } from "./core/importer";
+import { ImportModal, type ImportRequest, type ImportProgress } from "./import-modal";
+import { RendererPlugin } from "./renderer";
+
+export default class WolaiMigrationPlugin extends RendererPlugin {
+  declare data: ConvertedIndex | null;
+  activeImport?: AbortSignal;
+  importModal?: ImportModal;
+
+  async onload() {
+    await super.onload();
+    this.addRibbonIcon("download", "导入 wolai ZIP", () => this.openImport());
+    this.addCommand({
+      id: "import-wolai-html",
+      name: "导入 wolai HTML ZIP",
+      callback: () => this.openImport(),
+    });
+    this.addCommand({
+      id: "import-with-bases",
+      name: "导入 wolai HTML ZIP 和数据库补充包",
+      callback: () => this.openImport(true),
+    });
+  }
+
+  onunload() {
+    this.importModal?.close();
+    super.onunload();
+  }
+
+  openImport(withSupplement = false) {
+    if (this.activeImport) {
+      new Notice("正在导入，请等待本次导入结束");
+      return;
+    }
+    this.importModal?.close();
+    const modal = new ImportModal(this.app, withSupplement, (request, update) => this.importZip(request, update), () => {
+      if (this.importModal === modal) this.importModal = undefined;
+    });
+    this.importModal = modal;
+    modal.open();
+  }
+
+  private async importZip(request: ImportRequest, update: (progress: ImportProgress) => void) {
+    if (this.activeImport) throw new Error("已有导入正在进行");
+    this.activeImport = request.signal;
+    const checkCancelled = () => {
+      if (request.signal.aborted) throw new ImportCancelledError();
+    };
+    try {
+      checkZipSize(request.archive.size);
+      if (request.supplement) checkZipSize(request.supplement.size);
+      update({ label: "正在读取 ZIP…", value: 5 });
+      const bytes = new Uint8Array(await request.archive.arrayBuffer());
+      checkCancelled();
+      update({ label: "正在解压 ZIP…", value: 15 });
+      const archive = await readZip(bytes, request.signal);
+      const databaseSupplement = request.supplement
+        ? readDatabaseSupplement(new Uint8Array(await request.supplement.arrayBuffer()), parseYaml, stringifyYaml)
+        : undefined;
+      checkCancelled();
+      update({ label: "正在解析页面…", value: 30 });
+      const vault = this.app.vault;
+      const existingNames = new Set(vault.getRoot().children.map((file) => file.name.normalize("NFC").toLowerCase()));
+      const result = convertArchive(archive, {
+        parseHTML: (html: string) => new DOMParser().parseFromString(html, "text/html"),
+        databaseSupplement,
+        isTargetOccupied: (path) => existingNames.has(path.normalize("NFC").toLowerCase()),
+        isCancelled: () => request.signal.aborted,
+      });
+      await this.writeImport(result, request.signal, update);
+    } finally {
+      this.activeImport = undefined;
+    }
+  }
+
+  private async writeImport(result: ConvertResult, signal: AbortSignal, update: (progress: ImportProgress) => void) {
+    const rootFolder = result.rootPath.split("/")[0];
+    await writeConverted(this.app.vault, result.files, {
+      exclusiveRoot: rootFolder,
+      isCancelled: () => signal.aborted,
+      onProgress: (done, total) => {
+        if (done === 1 || done === total || done % 10 === 0) {
+          update({ label: `正在写入 ${done} / ${total} 个文件…`, value: 40 + done / total * 55 });
+        }
+      },
+      commit: async () => {
+        update({ label: "正在保存页面导航…", value: 98, committing: true });
+        const previous = this.data;
+        const index: ConvertedIndex = {
+          ...result.index,
+          roots: [...new Set([...(previous?.roots ?? []), ...result.index.roots])],
+          nodes: { ...previous?.nodes, ...result.index.nodes },
+          blockPaths: { ...previous?.blockPaths, ...result.index.blockPaths },
+        };
+        await this.saveData(index);
+        this.data = index;
+      },
+    });
+
+    this.error = null;
+    try {
+      await this.reveal();
+      this.expandRoot(result.rootPath);
+      await this.open(result.rootPath, undefined);
+      this.refreshViews();
+    } catch (error) {
+      console.error("[wolai-migration] 无法打开导入结果", error);
+    }
+    const references = result.stats.externalLinks ? ` · ${result.stats.externalLinks} 处原链接，见迁移报告` : "";
+    new Notice(`已导入 ${result.stats.pages} 篇页面到「${rootFolder}」${references}`, 8000);
+  }
+}
