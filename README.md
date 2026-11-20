@@ -4,27 +4,51 @@
 
 wolai 和 Obsidian 的页面组织方式不同，搬家时最费工的是重搭页面树、重新排版、找回图片和接好链接。Wolai Migration 会把原来的子页面层级、分栏、折叠和表格转换成适合 Obsidian 阅读的结构，让图片、附件和可解析的内链一起迁过去。
 
-[下载安装包](../../releases/latest) · [三步迁移](#三步迁移) · [查看迁移范围](#会迁移什么) · [English summary](#english-summary)
-
-## 三步迁移
-
-在 Obsidian [安装插件](#安装)后，用原始 HTML ZIP 开始迁移。
-
-1. 在 wolai 中选择「导出 → HTML」，保存生成的 ZIP。
-2. 在 Obsidian 命令面板运行「导入 wolai HTML ZIP」，或点击左侧的下载图标。
-3. 拖入 ZIP 或点击选择文件。插件立即开始导入，完成后自动打开根页面。
-
-每次迁移会按根页面名称新建一个目录。遇到同名目录时会自动编号。打开根页面后，可在阅读视图查看原来的布局，在 `_wolai/迁移报告.md` 查看导入数量和无法转换的引用。
+[从这里打开导入窗口](#1-打开导入窗口) · [Obsidian 社区插件页](https://community.obsidian.md/plugins/wolai-migration) · [查看迁移范围](#会迁移什么) · [English summary](#english-summary)
 
 ## 安装
 
-当前版本支持 **Obsidian 桌面版 1.15.1 或更高**。
+当前版本支持 **Obsidian 桌面版 1.15.1 或更高**。先打开你要导入到的笔记库。
+
+1. 打开「设置 → 第三方插件 → 浏览」。如果看到「退出受限模式」，先点击它，再进入「浏览」。
+2. 搜索 **Wolai Migration**，打开详情，依次点击 **「安装」** 和 **「启用」**。按钮变成「禁用」即表示插件已启用。
+
+![在 Obsidian 社区插件市场搜索 Wolai Migration，安装后点击紫色的启用按钮](./docs/images/enable-plugin.jpg)
+
+<details>
+<summary>从 GitHub 手动安装</summary>
 
 1. 在 [GitHub Releases](../../releases/latest) 下载 `wolai-migration-版本号.zip`。
 2. 把解压出来的 `wolai-migration` 文件夹放到笔记库的 `.obsidian/plugins/` 目录。
-3. 在 Obsidian 的「设置 → 第三方插件」里启用 **Wolai Migration**。
+3. 重新打开 Obsidian，在「设置 → 第三方插件」的已安装列表中启用 **Wolai Migration**。
 
 也可以下载单独的 `main.js`、`manifest.json` 和 `styles.css`，放入 `.obsidian/plugins/wolai-migration/`。
+
+</details>
+
+## 三步迁移
+
+### 1. 打开导入窗口
+
+**关闭插件市场和设置窗口，回到笔记库主界面。** 按 **`⌘P`**（macOS）或 **`Ctrl+P`**（Windows、Linux）打开命令面板，搜索 **「导入 wolai HTML ZIP」**，选中下图第一项 **「Wolai Migration: 导入 wolai HTML ZIP」**，按回车。
+
+![在笔记库主界面打开命令面板，选中第一项 Wolai Migration: 导入 wolai HTML ZIP](./docs/images/open-import-command.jpg)
+
+也可以点图中最左侧竖栏的 **下载图标**，悬停时会显示「导入 wolai ZIP」。左侧功能区隐藏时，用命令面板就能打开。
+
+### 2. 拖入从 wolai 导出的 ZIP 包
+
+在 wolai 里选「导出 → HTML」，把下载的 ZIP 原样拖到「导入 wolai」窗口的虚线框内。也可以点击虚线框选择文件。选中后会自动开始导入。
+
+![导入 wolai 窗口，中间的虚线框可接收 ZIP，也可以点击选择文件](./docs/images/import-zip.jpg)
+
+### 3. 查看导入结果
+
+看到「已导入 … 篇页面」后，Obsidian 会自动打开迁移后的根页面。左侧 **「我的页面」** 可以展开目录并打开子页面。
+
+![导入完成后自动打开旅行计划，左侧我的页面显示行前清单和预算记录](./docs/images/import-result.jpg)
+
+每次迁移都会在当前笔记库下按根页面名称新建目录，遇到同名会自动编号。可以在阅读视图查看迁移后的布局，并在该目录的 `_wolai/迁移报告.md` 查看导入数量和无法转换的引用。
 
 ## 会迁移什么
 
@@ -68,11 +92,11 @@ Move your Wolai notes to Obsidian in one step after export. The importer preserv
 
 ### Installation
 
-On Obsidian Desktop 1.15.1 or later, download the installation ZIP from [GitHub Releases](../../releases/latest). Extract the `wolai-migration` folder into `.obsidian/plugins/` inside your vault, then enable **Wolai Migration** in **Settings → Community plugins**.
+On Obsidian Desktop 1.15.1 or later, open **Settings → Community plugins → Browse**. Search for **Wolai Migration**, then select **Install** and **Enable**. The [installation screenshot](#安装) also shows where to find the Enable button.
 
 ### Usage
 
-Export your notes from Wolai as HTML. In Obsidian, choose **导入 wolai HTML ZIP** in the command palette or click the download icon, then drop or select the export ZIP. Import starts immediately. See `_wolai/迁移报告.md` in the new folder for the migration report.
+Export your notes from Wolai as HTML and keep the ZIP. Close the plugin browser and Settings to return to your vault. Press **Cmd+P** on macOS or **Ctrl+P** on Windows and Linux, then run **Wolai Migration: 导入 wolai HTML ZIP**. The download icon on the left ribbon opens the same dialog. Drop or select the export ZIP to start importing. Obsidian opens the migrated root note and shows its child pages on the left. See the [illustrated walkthrough](#三步迁移) for the screens and `_wolai/迁移报告.md` in the new folder for the migration report.
 
 A Wolai link keeps its original address when the export does not contain the target. Native Bases require an explicitly selected database supplement.
 
