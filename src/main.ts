@@ -1,13 +1,12 @@
 import { Notice, parseYaml, stringifyYaml } from "obsidian";
 import { checkZipSize, ImportCancelledError, readZip } from "./core/archive";
 import { readDatabaseSupplement } from "./core/database-supplement";
-import { convertArchive, writeConverted, type ConvertedIndex, type ConvertResult } from "./core/importer";
+import { convertArchive, writeConverted, type ConvertResult } from "./core/importer";
+import type { ConvertedIndex } from "./core/import-index";
 import { ImportModal, type ImportRequest, type ImportProgress } from "./import-modal";
 import { RendererPlugin } from "./renderer";
 
 export default class WolaiMigrationPlugin extends RendererPlugin {
-  declare data: ConvertedIndex | null;
-  activeImport?: AbortSignal;
   importModal?: ImportModal;
 
   async onload() {
@@ -81,6 +80,7 @@ export default class WolaiMigrationPlugin extends RendererPlugin {
     await writeConverted(this.app.vault, result.files, {
       exclusiveRoot: rootFolder,
       isCancelled: () => signal.aborted,
+      yieldToUI: () => new Promise<void>((resolve) => window.setTimeout(resolve, 0)),
       onProgress: (done, total) => {
         if (done === 1 || done === total || done % 10 === 0) {
           update({ label: `正在写入 ${done} / ${total} 个文件…`, value: 40 + done / total * 55 });

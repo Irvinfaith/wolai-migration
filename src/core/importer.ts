@@ -1,6 +1,10 @@
 /* Core: wolai HTML export -> Obsidian vault files. DOM-agnostic (DOMParser injected). */
 import { strFromU8, type Unzipped } from "fflate";
 import { ImportCancelledError, readZipSync } from "./archive";
+import type { ConvertedIndex, IndexNode, PageIcon, PageSettings } from "./import-index";
+import type { TableCell } from "./block-data";
+import { errorMessage, isRecord } from "./validation";
+import { cleanFileName } from "./file-name";
 import { databaseSourceIds, readBaseConfig, type DatabaseSource, type DatabaseSupplement } from "./database-supplement";
 
 export interface ConvertOptions {
@@ -9,7 +13,7 @@ export interface ConvertOptions {
   importIcons?: boolean;
   demoteH1?: boolean;
   databaseSupplement?: DatabaseSupplement;
-  parseHTML: (html: string) => any;
+  parseHTML: (html: string) => Document;
   onProgress?: (p: { phase: string; current: number; total: number; message?: string }) => void;
   isCancelled?: () => boolean;
 }
@@ -17,14 +21,6 @@ export interface ConvertOptions {
 export interface ConvertedFile {
   path: string;
   data: string | Uint8Array;
-}
-
-export interface ConvertedIndex {
-  version: 1;
-  roots: string[];
-  sourceSnapshot: string;
-  blockPaths: Record<string, string>;
-  nodes: Record<string, any>;
 }
 
 export interface ConvertStats {
@@ -78,8 +74,7 @@ function decodeUri(s: string): string {
   try { return decodeURIComponent(s); } catch { return s; }
 }
 function safeFileName(s: string): string {
-  const name = String(s || "").replace(/[\\/:*?"<>|#^\[\]\x00-\x1f]/g, " ")
-    .replace(/\s+/g, " ").trim().replace(/[ .]+$/, "") || "未命名";
+  const name = cleanFileName(s).replace(/[ .]+$/, "") || "未命名";
   // Legacy Windows device names are reserved even with an extension.
   return /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(name) ? "_" + name : name;
 }
@@ -89,29 +84,33 @@ function safeLabel(s: string): string {
 function htmlEscape(s: string): string {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
-function classes(el: any): string[] {
-  return el && el.classList ? Array.from(el.classList) as string[] : [];
+function classes(el: Element): string[] {
+  return Array.from(el.classList);
 }
-function hasClass(el: any, c: string): boolean {
-  return !!(el && el.classList && el.classList.contains(c));
+function hasClass(el: Element | null, name: string): boolean {
+  return el?.classList.contains(name) ?? false;
 }
-function tagName(el: any): string {
-  return (el && el.tagName ? String(el.tagName) : "").toLowerCase();
+function tagName(el: Element | null | undefined): string {
+  return el?.tagName.toLowerCase() ?? "";
 }
-function children(el: any): any[] {
-  return el ? Array.from(el.children || []) : [];
+function children(el: Element): Element[] {
+  return Array.from(el.children);
 }
-function textOf(el: any): string {
-  return el ? String(el.textContent || "") : "";
+function textOf(el: Node | null): string {
+  return el?.textContent ?? "";
 }
-function attr(el: any, name: string): string | null {
-  return el && el.getAttribute ? el.getAttribute(name) : null;
+function attr(el: Element | null, name: string): string | null {
+  return el?.getAttribute(name) ?? null;
 }
-function find(el: any, selector: string): any | null {
-  return el && el.querySelector ? el.querySelector(selector) : null;
+function find(el: ParentNode | null, selector: string): Element | null {
+  return el?.querySelector(selector) ?? null;
 }
-function findAll(el: any, selector: string): any[] {
-  return el && el.querySelectorAll ? Array.from(el.querySelectorAll(selector)) : [];
+function findAll(el: ParentNode, selector: string): Element[] {
+  return Array.from(el.querySelectorAll(selector));
+}
+function isElement(node: Node): node is Element {
+  // The browser and the test HTML parser provide elements from different realms.
+  return node.nodeType === 1;
 }
 
 function cssClasses(cls: string[]): string[] {
@@ -125,7 +124,7 @@ function cssClasses(cls: string[]): string[] {
   return out;
 }
 
-function fence(kind: string, obj: any): string {
+function fence(kind: string, obj: unknown): string {
   return "```wolai-" + kind + "\n" + JSON.stringify(obj) + "\n```";
 }
 
@@ -173,7 +172,7 @@ function escText(s: string, mode: "md" | "html", table = false): string {
 function cleanInline(s: string): string {
   s = String(s || "").trim();
   s = s.replace(/^(?:<br>\s*)+/, "").replace(/(?:\s*<br>)+$/, "");
-  s = s.replace(/([^\s\[（(：:，,。.!?！？;；"“”>])(!?\[\[)/g, "$1 $2");
+  s = s.replace(/([^\s[（(：:，,。.!?！？;；"“”>])(!?\[\[)/g, "$1 $2");
   return s.trim();
 }
 
@@ -202,13 +201,13 @@ interface Page {
   key: string;
   title: string;
   fileName: string;
-  doc: any;
-  article: any;
+  doc: Document;
+  article: Element;
   children: string[];
   parent: string | null;
-  icon: any;
+  icon: PageIcon | null;
   cover: string | null;
-  settings: any;
+  settings: PageSettings;
   vaultDir: string;
   vaultPath: string;
   sourceId: string | null;
@@ -216,8 +215,8 @@ interface Page {
 
 interface Ctx {
   pages: Record<string, Page>;
-  pageid: Record<string, string>;
-  block2page: Record<string, string>;
+  pageid: Map<string, string>;
+  block2page: Map<string, string | null>;
   options: ConvertOptions;
   databases: Map<string, ImportedDatabase>;
   recordsBySource: Map<string, ImportedRecord | null>;
@@ -278,7 +277,7 @@ function noteUnresolvedLink(ctx: Ctx, page: Page, href: string, label: string, r
 }
 
 function canLinkBlock(ctx: Ctx, id: string, rel: string): boolean {
-  if (ctx.block2page[id] !== rel) return false;
+  if (ctx.block2page.get(id) !== rel) return false;
   ctx.requestedAnchors.add(id);
   return !ctx.nativeAnchors || ctx.nativeAnchors.has(id);
 }
@@ -320,8 +319,8 @@ function linkMd(href: string, label: string, ctx: Ctx, page: Page, mode: "md" | 
     const [pid, bid] = databaseSourceIds(href);
     if (pid) {
       const databaseSource = label === "无标题数据表格" || (!bid && pid === curBlock);
-      const pageRel = ctx.pageid[pid];
-      const blockRel = ctx.block2page[pid];
+      const pageRel = ctx.pageid.get(pid);
+      const blockRel = ctx.block2page.get(pid);
       const target = pageRel || blockRel;
       const anchor = bid && bid !== pid ? bid : pageRel ? undefined : pid;
       if (!databaseSource && target && (!anchor || canLinkBlock(ctx, anchor, target))) {
@@ -356,14 +355,14 @@ function linkMd(href: string, label: string, ctx: Ctx, page: Page, mode: "md" | 
   return label;
 }
 
-function inline(el: any, ctx: Ctx, page: Page, mode: "md" | "html" = "md", table = false, curBlock: string | null = null): string {
+function inline(el: Node, ctx: Ctx, page: Page, mode: "md" | "html" = "md", table = false, curBlock: string | null = null): string {
   const out: string[] = [];
-  for (const node of Array.from(el.childNodes || []) as any[]) {
+  for (const node of Array.from(el.childNodes)) {
     if (node.nodeType === 3) {
       out.push(escText(node.nodeValue || "", mode, table));
       continue;
     }
-    if (node.nodeType !== 1) continue;
+    if (!isElement(node)) continue;
     const tag = tagName(node);
     const cls = classes(node);
     if (tag === "span") {
@@ -415,13 +414,13 @@ function inline(el: any, ctx: Ctx, page: Page, mode: "md" | "html" = "md", table
 
 // ---------------------------------------------------------------- blocks
 
-function withId(text: string, el: any, inlineId = false): string {
+function withId(text: string, el: Element, inlineId = false): string {
   const bid = attr(el, "id");
   if (!bid) return text;
   return inlineId ? text + " ^w-" + bid : text + "\n\n^w-" + bid;
 }
 
-function convertBlocks(container: any, ctx: Ctx, page: Page, skip?: any): string {
+function convertBlocks(container: Element, ctx: Ctx, page: Page, skip?: Element): string {
   const out: (string | null)[] = [];
   for (const c of children(container)) {
     if (skip && c === skip) continue;
@@ -430,15 +429,15 @@ function convertBlocks(container: any, ctx: Ctx, page: Page, skip?: any): string
   return joinBlocks(out);
 }
 
-function convertTableCell(cell: any, ctx: Ctx, page: Page, blockId: string | null): string {
+function convertTableCell(cell: Element, ctx: Ctx, page: Page, blockId: string | null): string {
   const parts: (string | null)[] = [];
   let inlineRun = cell.cloneNode(false);
   const flush = () => {
     parts.push(cleanInline(inline(inlineRun, ctx, page, "md", false, blockId)));
     inlineRun = cell.cloneNode(false);
   };
-  for (const child of Array.from(cell.childNodes ?? []) as any[]) {
-    const isBlock = child.nodeType === 1 && (hasClass(child, "wolai-block")
+  for (const child of Array.from(cell.childNodes)) {
+    const isBlock = isElement(child) && (hasClass(child, "wolai-block")
       || ["p", "ul", "ol", "figure", "table", "details", "pre", "blockquote"].includes(tagName(child)));
     if (isBlock) {
       flush();
@@ -455,7 +454,7 @@ function headingLevel(tag: string, demoteH1: boolean): number {
   return level === 1 && demoteH1 ? 2 : level;
 }
 
-function convertBlock(el: any, ctx: Ctx, page: Page): string | null {
+function convertBlock(el: Element, ctx: Ctx, page: Page): string | null {
   const cls = classes(el);
   const tag = tagName(el);
   const bid = attr(el, "id");
@@ -517,14 +516,14 @@ function convertBlock(el: any, ctx: Ctx, page: Page): string | null {
   if (cls.includes("wolai-simple-table") || tag === "table") {
     const table = tag === "table" ? el : find(el, "table");
     if (!table) return null;
-    const rows: any[][] = [];
+    const rows: TableCell[][] = [];
     for (const tr of findAll(table, "tr")) {
       if (tr.closest("table") !== table) continue;
-      const row: any[] = [];
+      const row: TableCell[] = [];
       for (const cell of children(tr)) {
         if (!["th", "td"].includes(tagName(cell))) continue;
         const markdown = convertTableCell(cell, ctx, page, bid);
-        const item: any = { markdown };
+        const item: TableCell = { markdown };
         if (tagName(cell) === "th") item.header = tagName(tr.parentElement) === "thead" || attr(cell, "scope") !== "row" ? "col" : "row";
         const ccls = cssClasses(classes(cell));
         if (ccls.length) item.classes = ccls;
@@ -532,7 +531,7 @@ function convertBlock(el: any, ctx: Ctx, page: Page): string | null {
         const width = parseWidth(style) ?? positiveInteger(attr(cell, "width"));
         if (width) item.width = width;
         const align = parseStyle(style, "text-align") ?? attr(cell, "align");
-        if (align && ["left", "center", "right", "justify"].includes(align)) item.align = align;
+        if (align === "left" || align === "center" || align === "right" || align === "justify") item.align = align;
         const colspan = positiveInteger(attr(cell, "colspan"));
         const rowspan = positiveInteger(attr(cell, "rowspan"));
         if (colspan && colspan > 1) item.colspan = colspan;
@@ -701,11 +700,12 @@ function writeDatabaseFiles(ctx: Ctx, index: ConvertedIndex, output: Map<string,
     output.set(path, readBaseConfig(source, supplement, recordsFolder));
     for (const record of source.records) {
       const destination = sharedLinks.get(record.path);
+      if (!destination) throw new Error(`数据库记录目标路径缺失：${record.title}`);
       const markdown = strFromU8(supplement.files[`vault/${record.path}`]);
       const yaml = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown)?.[1];
-      const properties = yaml ? supplement.parseYaml(yaml) as Record<string, unknown> : null;
-      if (properties?._wolai_database !== source.id) throw new Error(`数据库记录归属无法核验：${source.title} / ${record.title}`);
-      const rebased = markdown.replace(/(\[\[)([^\]\n|#]+)(?=[\]|#])/g, (whole, open, link) => {
+      const properties = yaml ? supplement.parseYaml(yaml) : null;
+      if (!isRecord(properties) || properties._wolai_database !== source.id) throw new Error(`数据库记录归属无法核验：${source.title} / ${record.title}`);
+      const rebased = markdown.replace(/(\[\[)([^\]\n|#]+)(?=[\]|#])/g, (whole: string, open: string, link: string) => {
         const local = links.get(link) ?? sharedLinks.get(link);
         return local ? open + local : whole;
       });
@@ -729,7 +729,7 @@ function writeDatabaseFiles(ctx: Ctx, index: ConvertedIndex, output: Map<string,
   }
 }
 
-function convertList(el: any, ctx: Ctx, page: Page): string {
+function convertList(el: Element, ctx: Ctx, page: Page): string {
   const ordered = tagName(el) === "ol";
   const lines: string[] = [];
   let number = positiveInteger(attr(el, "start")) ?? 1;
@@ -738,13 +738,13 @@ function convertList(el: any, ctx: Ctx, page: Page): string {
     const bid = attr(li, "id");
     const lead = li.cloneNode(false);
     const blocks: string[] = [];
-    for (const c of Array.from(li.childNodes || []) as any[]) {
+    for (const c of Array.from(li.childNodes)) {
       if (c.nodeType === 3) {
         const text = String(c.nodeValue ?? "");
         if (text.trim() || (text && !/[\r\n]/.test(text))) lead.appendChild(c.cloneNode(true));
         continue;
       }
-      if (c.nodeType !== 1) continue;
+      if (!isElement(c)) continue;
       const t = tagName(c);
       if (["span", "b", "i", "em", "strong", "u", "s", "del", "code", "br", "a", "img"].includes(t)) {
         lead.appendChild(c.cloneNode(true));
@@ -765,7 +765,7 @@ function convertList(el: any, ctx: Ctx, page: Page): string {
   return lines.join("\n");
 }
 
-function convertImage(el: any, ctx: Ctx, page: Page): string | null {
+function convertImage(el: Element, ctx: Ctx, page: Page): string | null {
   const fig = tagName(el) === "figure" ? el : find(el, "figure");
   const img = fig ? find(fig, "img") : null;
   if (!img) return null;
@@ -788,7 +788,7 @@ function convertImage(el: any, ctx: Ctx, page: Page): string | null {
 
 // ---------------------------------------------------------------- pages
 
-function loadPages(files: Record<string, Uint8Array>, htmlKeys: string[], rootKey: string, parseHTML: (s: string) => any): Record<string, Page> {
+function loadPages(files: Record<string, Uint8Array>, htmlKeys: string[], rootKey: string, parseHTML: ConvertOptions["parseHTML"]): Record<string, Page> {
   const pages: Record<string, Page> = {};
   const decoder = new TextDecoder("utf-8");
   for (const key of htmlKeys) {
@@ -809,8 +809,8 @@ function loadPages(files: Record<string, Uint8Array>, htmlKeys: string[], rootKe
   return pages;
 }
 
-function setupPages(pages: Record<string, Page>, rootRel: string): { pageid: Record<string, string> } {
-  const pageid: Record<string, string> = {};
+function setupPages(pages: Record<string, Page>, rootRel: string): { pageid: Map<string, string> } {
+  const pageid = new Map<string, string>();
   for (const rel of Object.keys(pages)) {
     const p = pages[rel];
     for (const sp of findAll(p.article, ".wolai-sub-page")) {
@@ -821,7 +821,7 @@ function setupPages(pages: Record<string, Page>, rootRel: string): { pageid: Rec
       const q = pages[target];
       if (!q) continue;
       const id = attr(sp, "id");
-      if (id) pageid[id] = target;
+      if (id) pageid.set(id, target);
       if (!q.parent) q.parent = rel;
       if (!p.children.includes(target)) p.children.push(target);
       if (!q.sourceId) q.sourceId = id;
@@ -891,10 +891,10 @@ function assignVaultPaths(pages: Record<string, Page>, rootRel: string, targetRo
 }
 
 function buildIndex(pages: Record<string, Page>, rootRel: string): ConvertedIndex {
-  const nodes: Record<string, any> = {};
+  const nodes: Record<string, IndexNode> = {};
   for (const rel of Object.keys(pages)) {
     const p = pages[rel];
-    const node: any = {
+    const node: IndexNode = {
       path: p.vaultPath,
       title: p.title,
       type: "page",
@@ -955,21 +955,21 @@ export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertR
 
   options.onProgress && options.onProgress({ phase: "tree", current: 0, total: 1, message: "构建页面树" });
   const { pageid } = setupPages(pages, rootRel);
-  pageid[basename(rootKey)] = rootRel;
+  pageid.set(basename(rootKey), rootRel);
   assignVaultPaths(pages, rootRel, targetRoot);
   const databases = findReferencedDatabases(pages, supplement);
 
-  const block2page: Record<string, string> = Object.create(null);
+  const block2page = new Map<string, string | null>();
   for (const rel of Object.keys(pages)) {
     for (const el of findAll(pages[rel].article, "[id]")) {
       const id = attr(el, "id");
-      if (/^[a-z0-9-]+$/i.test(id ?? "")) block2page[id] = Object.hasOwn(block2page, id) && block2page[id] !== rel ? null : rel;
+      if (id && /^[a-z0-9-]+$/i.test(id)) block2page.set(id, block2page.has(id) && block2page.get(id) !== rel ? null : rel);
     }
   }
 
   const stats: ConvertStats = {
     pages: Object.keys(pages).length,
-    blocks: Object.keys(block2page).length,
+    blocks: block2page.size,
     assets: 0,
     dbPlaceholders: 0,
     databases: 0,
@@ -993,8 +993,8 @@ export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertR
     if (options.isCancelled?.()) throw new ImportCancelledError();
     const p = pages[rel];
     pageMeta(p, options.importIcons !== false);
-    if (p.cover && /^https?:\/\//i.test(p.cover) && p.sourceId && supplement?.covers.has(p.sourceId)) {
-      const source = supplement.covers.get(p.sourceId);
+    const source = p.cover && /^https?:\/\//i.test(p.cover) && p.sourceId ? supplement?.covers.get(p.sourceId) : undefined;
+    if (source && supplement) {
       const extension = source.slice(stripExt(source).length).toLowerCase();
       p.cover = `${p.vaultDir}/_wolai/cover-${p.sourceId}${extension}`;
       cachedCovers.set(p.cover, supplement.files[`vault/${source}`]);
@@ -1015,7 +1015,7 @@ export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertR
       const markdown = "# " + p.title + "\n\n" + convertBlocks(p.article, ctx, p) + "\n";
       out.set(p.vaultPath, markdown);
       for (const m of markdown.matchAll(/\^w-([A-Za-z0-9-]+)/g)) emitted.add(m[1]);
-      for (const id of nativeBlockIds(markdown)) if (block2page[id] === rel) native.add(id);
+      for (const id of nativeBlockIds(markdown)) if (block2page.get(id) === rel) native.add(id);
     }
     return { emitted, native };
   };
@@ -1031,9 +1031,12 @@ export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertR
     stats.fences = { columns: 0, table: 0, styled: 0 };
     rendered = renderPages();
   }
-  for (const id of rendered.native) index.blockPaths[id] = pages[block2page[id]].vaultPath;
+  for (const id of rendered.native) {
+    const rel = block2page.get(id);
+    if (rel) index.blockPaths[id] = pages[rel].vaultPath;
+  }
   stats.emittedIds = rendered.emitted.size;
-  stats.droppedIds = Object.keys(block2page).filter((id) => !rendered.emitted.has(id)).length;
+  stats.droppedIds = [...block2page.keys()].filter((id) => !rendered.emitted.has(id)).length;
 
   // files: media
   for (const rel of rels) {
@@ -1138,6 +1141,7 @@ export async function writeConverted(
   opts: {
     onProgress?: (done: number, total: number) => void;
     isCancelled?: () => boolean;
+    yieldToUI?: () => Promise<void>;
     commit?: () => Promise<void>;
     exclusiveRoot?: string;
   } = {},
@@ -1171,12 +1175,12 @@ export async function writeConverted(
       if (typeof data === "string") remember(await vault.create(path, data));
       else {
         const wholeBuffer = data.buffer instanceof ArrayBuffer && data.byteOffset === 0 && data.byteLength === data.buffer.byteLength;
-        const buffer = wholeBuffer ? data.buffer as ArrayBuffer : new Uint8Array(data).buffer;
+        const buffer = wholeBuffer ? data.buffer : new Uint8Array(data).buffer;
         remember(await vault.createBinary(path, buffer));
       }
       done++;
       opts.onProgress?.(done, files.length);
-      if (done % 10 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+      if (done % 10 === 0 && opts.yieldToUI) await opts.yieldToUI();
     }
     checkCancelled();
     await opts.commit?.();
@@ -1196,7 +1200,7 @@ export async function writeConverted(
       retained.push(path);
     }
     if (retained.length) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       throw new Error(`${message}。以下导入项目已保留，请检查后再重试：${retained.slice(0, 3).join("、")}`, { cause: error });
     }
     throw error;

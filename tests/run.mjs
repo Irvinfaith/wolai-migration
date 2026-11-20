@@ -8,7 +8,8 @@ import { convertExport, ImportCancelledError, writeConverted } from '../dist/imp
 import { columnLabel, openWorkbook } from '../dist/xlsx-preview.mjs';
 import { readDatabaseSupplement } from '../dist/database-supplement.mjs';
 import { readZip, readZipSync } from '../dist/archive.mjs';
-import { restrictIndexToImports } from '../dist/import-index.mjs';
+import { readImportIndex, restrictIndexToImports } from '../dist/import-index.mjs';
+import { readColumns, readDatabaseForm, readImage, readProgress, readTable, readTemplate } from '../dist/block-data.mjs';
 
 const parseHTML = (html) => new DOMParser().parseFromString(html, 'text/html');
 const parseXml = (xml) => new DOMParser().parseFromString(xml, 'application/xml');
@@ -304,11 +305,45 @@ test('keeps only verified import folders when reading an index from an older plu
     },
     blockPaths: { ...original.blockPaths, unrelated: plain },
   };
-  const scoped = restrictIndexToImports(index);
+  const scoped = restrictIndexToImports(readImportIndex(index));
   assert.deepEqual(scoped.roots, [result.rootPath, historical]);
   assert(!scoped.nodes[plain] && !scoped.nodes[sibling]);
   assert.deepEqual(scoped.nodes[historical].children, []);
   assert.deepEqual(scoped.blockPaths, original.blockPaths);
+});
+
+test('normalizes legacy index defaults and rejects invalid stored node fields', () => {
+  const root = '归档/归档.md';
+  const saved = {
+    version: 1,
+    roots: [root],
+    nodes: {
+      [root]: { path: root, title: '归档', type: 'page', children: null, icon: null,
+        sourceId: 'LegacyId', sourceUrl: 'https://www.wolai.com/LegacyId' },
+    },
+  };
+  const index = restrictIndexToImports(readImportIndex(saved));
+  assert.deepEqual(index.roots, [root]);
+  assert.deepEqual(index.nodes[root].children, []);
+  assert.deepEqual(index.blockPaths, {});
+  for (const invalid of [{ children: '无效' }, { children: ['缺失.md'] }, { schema: [null] }, { icon: { path: [] } }]) {
+    assert.throws(() => readImportIndex({ ...saved, nodes: { [root]: { ...saved.nodes[root], ...invalid } } }),
+      /页面定义不完整|子页面定义缺失/);
+  }
+});
+
+test('reads existing block payloads while rejecting invalid render inputs', () => {
+  assert.deepEqual(readColumns('[{"markdown":"正文","weight":2}]'), [{ markdown: '正文', weight: 2 }]);
+  assert.deepEqual(readTable('{"rows":[[{"markdown":"表头","header":true,"colspan":2}]]}').rows,
+    [[{ markdown: '表头', header: true, colspan: 2 }]]);
+  assert.deepEqual(readTemplate('{"name":"新建记录","body":"# 新记录"}'), { name: '新建记录', body: '# 新记录' });
+  assert.deepEqual(readTemplate('{"name":"新建记录","template":"模板.md"}'), { name: '新建记录', template: '模板.md' });
+  assert.throws(() => readTemplate('{"name":"新建记录"}'), /模板定义无效/);
+  assert.throws(() => readColumns('[{"markdown":"正文","weight":"2"}]'), /分栏数据无效/);
+  assert.throws(() => readImage('{"markdown":"正文","caption":"","align":"left","width":["15%"]}'), /图片版式无效/);
+  assert.throws(() => readProgress('{"value":7,"max":5}'), /无效的进度值/);
+  assert.throws(() => readTable('{"rows":[[null]]}'), /表格单元格无效/);
+  assert.throws(() => readDatabaseForm('{"base":"台账.base","form":{"name":"录入","fields":[null]}}'), /表单定义无效/);
 });
 
 test('cancellation rolls back this import and allows a same-folder retry', async () => {

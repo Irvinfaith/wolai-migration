@@ -1,5 +1,6 @@
 import { App, Modal, Notice } from "obsidian";
 import { ImportCancelledError } from "./core/archive";
+import { isDomNode } from "./core/validation";
 
 export interface ImportRequest {
   archive: File;
@@ -24,6 +25,7 @@ export class ImportModal extends Modal {
   private status!: HTMLDivElement;
   private progress!: HTMLProgressElement;
   private cancelButton!: HTMLButtonElement;
+  private cancelActions!: HTMLDivElement;
 
   constructor(
     app: App,
@@ -53,7 +55,8 @@ export class ImportModal extends Modal {
     this.status = content.createDiv({ cls: "wolai-import-status", attr: { role: "status" } });
     this.progress = content.createEl("progress", { cls: "wolai-import-progress", attr: { "aria-label": "导入进度" } });
     this.progress.max = 100;
-    this.cancelButton = content.createDiv({ cls: "wolai-import-buttons" }).createEl("button", { text: "取消导入", type: "button" });
+    this.cancelActions = content.createDiv({ cls: "wolai-import-buttons" });
+    this.cancelButton = this.cancelActions.createEl("button", { text: "取消导入", type: "button" });
     this.cancelButton.onclick = () => {
       if (this.committing) return;
       this.operation?.abort();
@@ -76,7 +79,7 @@ export class ImportModal extends Modal {
     this.hint.setText(this.withSupplement ? "先选择 wolai 的 HTML 导出 ZIP" : "wolai → 导出 → HTML · 选择后自动导入");
     this.pickButton.disabled = false;
     this.progress.hidden = true;
-    this.cancelButton.hidden = true;
+    this.cancelActions.hidden = true;
   }
 
   private registerDrop() {
@@ -90,7 +93,7 @@ export class ImportModal extends Modal {
       if (!this.operation) this.pickButton.addClass("is-over");
     }, options);
     this.modalEl.addEventListener("dragleave", (event) => {
-      if (!(event.relatedTarget instanceof Node) || !this.modalEl.contains(event.relatedTarget)) {
+      if (!isDomNode(event.relatedTarget) || !this.modalEl.contains(event.relatedTarget)) {
         this.pickButton.removeClass("is-over");
       }
     }, options);
@@ -123,7 +126,7 @@ export class ImportModal extends Modal {
     this.pickButton.disabled = true;
     this.pickLabel.setText((this.archive ?? file).name);
     this.hint.empty();
-    this.cancelButton.hidden = false;
+    this.cancelActions.hidden = false;
     this.cancelButton.disabled = false;
     this.progress.hidden = false;
     this.progress.value = 0;

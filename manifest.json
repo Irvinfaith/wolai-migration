@@ -1,7 +1,7 @@
 {
   "id": "wolai-migration",
   "name": "Wolai Migration",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "minAppVersion": "1.15.1",
   "description": "Import notes from one Wolai HTML ZIP, preserving page hierarchy, layouts, attachments, and resolvable links.",
   "author": "Wolai Migration contributors",

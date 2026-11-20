@@ -46,6 +46,7 @@ function validateDirectory(bytes: Uint8Array, limits: ZipLimits, include: (entry
     if (++entries > limits.entries) throw new Error(`ZIP 超过 ${limits.entries} 个条目的上限`);
     const { name, originalSize, size, compression } = entry;
     const segments = name.replace(/\/$/, "").split("/");
+    // Reject control characters before an archive path reaches the vault.
     if (!name || name.includes("\\") || /[\0-\x1f]/.test(name) ||
       /^[a-z]:/i.test(name) || segments.some((segment) => !segment || segment === "." || segment === "..")) {
       throw new Error("ZIP 包含不安全的文件路径");

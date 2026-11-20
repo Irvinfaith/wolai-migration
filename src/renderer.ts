@@ -1,22 +1,40 @@
-// @ts-nocheck
-import {Plugin,ItemView,Modal,Notice,Menu,MarkdownRenderer,MarkdownRenderChild,TFile,normalizePath,parseYaml,stringifyYaml,setIcon,Platform} from 'obsidian';
-import { restrictIndexToImports } from "./core/import-index";
-import {columnLabel,openWorkbook} from './core/xlsx-preview';
+import {
+  Plugin, ItemView, Modal, Notice, Menu, MarkdownRenderer, MarkdownRenderChild, MarkdownView,
+  TFile, TFolder, normalizePath, parseYaml, stringifyYaml, setIcon, moment,
+  type App, type MarkdownPostProcessorContext, type MarkdownSectionInformation, type WorkspaceLeaf,
+} from "obsidian";
+import { isPageIcon, readImportIndex, restrictIndexToImports, validateIndexReferences, type ConvertedIndex, type IndexNode, type PageIcon } from "./core/import-index";
+import {
+  readBlockObject, readColumns, readDatabaseForm, readImage, readProgress, readStyled, readTable,
+  readTemplate, readToggle, type TemplateBlock,
+} from "./core/block-data";
+import { cleanFileName } from "./core/file-name";
+import { errorMessage, isArray, isDomNode, isRecord, isString } from "./core/validation";
+import { columnLabel, openWorkbook } from "./core/xlsx-preview";
+
+interface PagePosition { expected: string; at: number }
+interface PageRange { expected: string; start: number; end: number }
+interface PageDrag extends PageRange { childPath: string; parentPath: string; preview: HTMLElement }
+interface BodyCacheEntry { file: TFile; stamp: string; read: Promise<string | null> }
+interface CalendarModel { year: string; monthDay: string; big: string; desc: string }
+type TextAction = (text: string) => Promise<unknown> | void;
+type RecordValue = string | number | null;
+
 const VIEW='wolai-migration-pages';
 class NameModal extends Modal {
-  constructor(app,label,submit){super(app);this.label=label;this.submit=submit;}
+  constructor(app: App, private readonly label: string, private readonly submit: TextAction) { super(app); }
   onOpen(){
     this.contentEl.createEl('h3',{text:this.label});
     const input=this.contentEl.createEl('input',{type:'text',attr:{placeholder:'页面名称','aria-label':'页面名称'}});
     const button=this.contentEl.createEl('button',{text:'创建',cls:'mod-cta'});
-    const run=async()=>{const title=input.value.trim();if(!title){input.focus();return;}button.disabled=true;try{await this.submit(title);this.close();}catch(e){new Notice('创建失败：'+e.message);button.disabled=false;}};
-    input.addEventListener('keydown',e=>{if(e.key==='Enter')run();});button.onclick=run;input.focus();
+    const run=async()=>{const title=input.value.trim();if(!title){input.focus();return;}button.disabled=true;try{await this.submit(title);this.close();}catch(e){new Notice('创建失败：'+errorMessage(e));button.disabled=false;}};
+    input.addEventListener('keydown',e=>{if(e.key==='Enter' && !button.disabled)void run();});button.onclick=run;input.focus();
   }
   onClose(){this.contentEl.empty();}
 }
 class MarkdownEditModal extends Modal {
-  constructor(app,title,value,save){super(app);this.title=title;this.value=value;this.save=save;}
-  onOpen(){this.contentEl.createEl('h3',{text:this.title});const input=this.contentEl.createEl('textarea',{cls:'wolai-edit-text'});input.value=this.value;const button=this.contentEl.createEl('button',{text:'保存',cls:'mod-cta'});button.onclick=async()=>{button.disabled=true;try{await this.save(input.value);this.close();}catch(e){new Notice('保存失败：'+e.message);button.disabled=false;}};input.focus();}
+  constructor(app: App, private readonly title: string, private readonly value: string, private readonly save: TextAction) { super(app); }
+  onOpen(){this.contentEl.createEl('h3',{text:this.title});const input=this.contentEl.createEl('textarea',{cls:'wolai-edit-text'});input.value=this.value;const button=this.contentEl.createEl('button',{text:'保存',cls:'mod-cta'});button.onclick=async()=>{button.disabled=true;try{await this.save(input.value);this.close();}catch(e){new Notice('保存失败：'+errorMessage(e));button.disabled=false;}};input.focus();}
   onClose(){this.contentEl.empty();}
 }
 const EMOJI_GROUPS=[
@@ -26,26 +44,32 @@ const EMOJI_GROUPS=[
 const ICON_DATE_FORMATS=['YYYY/MM/DD','YYYY-MM-DD','M月D日','YYYY年M月','M/D','MMMM D, YYYY','YYYY/MM/DD dddd'];
 const ICON_IMAGE_EXTS=['png','jpg','jpeg','gif','svg','webp','bmp','avif'];
 class IconPickerModal extends Modal{
-  constructor(app,plugin,pagePath){
-    super(app);this.plugin=plugin;this.pagePath=pagePath;
-    const cur=plugin.data?.nodes[pagePath]?.icon;
-    this.icon=cur?JSON.parse(JSON.stringify(cur)):null;
-    this.tab=plugin.iconType(cur)||'emoji';
+  private icon: PageIcon | null;
+  private tab: NonNullable<PageIcon["type"]>;
+  private tabEls: Partial<Record<NonNullable<PageIcon["type"]>, HTMLButtonElement>> = {};
+  private bodyEl!: HTMLDivElement;
+  private previewEl!: HTMLDivElement;
+
+  constructor(app: App, private readonly plugin: RendererPlugin, private readonly pagePath: string) {
+    super(app);
+    const current = plugin.data?.nodes[pagePath]?.icon;
+    this.icon = current ? { ...current } : null;
+    this.tab = plugin.iconType(current) ?? 'emoji';
   }
   onOpen(){
-    const root=this.contentEl;root.addClass('wolai-icon-picker');
+    const root=this.contentEl;root.addClass('wolai-icon-picker');this.modalEl.addClass('wolai-modal-wide');
     root.createEl('h3',{text:'页面图标'});
     const bar=root.createDiv({cls:'wolai-icon-tabs'});this.tabEls={};
-    for(const [key,label] of [['emoji','表情'],['image','图片'],['date','日期'],['elapsed','距今 / 倒计时']]){
+    for(const [key,label] of [['emoji','表情'],['image','图片'],['date','日期'],['elapsed','距今 / 倒计时']] as const){
       const b=bar.createEl('button',{text:label,cls:'wolai-icon-tab'});
       b.onclick=()=>{this.tab=key;this.draw();};this.tabEls[key]=b;
     }
     this.bodyEl=root.createDiv({cls:'wolai-icon-body'});
     const foot=root.createDiv({cls:'wolai-icon-footer'});
     const save=foot.createEl('button',{text:'保存',cls:'mod-cta'});
-    save.onclick=async()=>{if(!this.plugin.iconType(this.icon)){new Notice('请先选择一个图标');return;}save.disabled=true;try{await this.plugin.setIcon(this.pagePath,this.icon);this.close();}catch(e){new Notice('保存失败：'+e.message);save.disabled=false;}};
+    save.onclick=async()=>{if(!this.plugin.iconType(this.icon)){new Notice('请先选择一个图标');return;}save.disabled=true;try{await this.plugin.setIcon(this.pagePath,this.icon);this.close();}catch(e){new Notice('保存失败：'+errorMessage(e));save.disabled=false;}};
     const rm=foot.createEl('button',{text:'移除图标'});
-    rm.onclick=async()=>{try{await this.plugin.setIcon(this.pagePath,null);this.close();}catch(e){new Notice('移除失败：'+e.message);}};
+    rm.onclick=async()=>{try{await this.plugin.setIcon(this.pagePath,null);this.close();}catch(e){new Notice('移除失败：'+errorMessage(e));}};
     this.draw();
   }
   onClose(){this.contentEl.empty();}
@@ -64,12 +88,12 @@ class IconPickerModal extends Modal{
     if(!this.plugin.iconType(this.icon)){el.createSpan({text:'（未选择）',cls:'wolai-color-gray'});return;}
     this.plugin.renderIcon(el,this.icon,'file-text');
   }
-  drawEmoji(b){
+  drawEmoji(b: HTMLElement){
     if(this.plugin.iconType(this.icon)!=='emoji')this.icon={type:'emoji',emoji:'📄'};
     const row=b.createDiv({cls:'wolai-icon-custom'});
     row.createSpan({text:'自定义：'});
     const input=row.createEl('input',{type:'text',attr:{placeholder:'粘贴任意 emoji'}});
-    input.value=this.icon.emoji||'';
+    input.value=this.icon?.emoji||'';
     input.oninput=()=>{const v=input.value.trim();this.icon={type:'emoji',emoji:v||'📄'};this.updatePreview();};
     for(const g of EMOJI_GROUPS){
       b.createDiv({text:g.name,cls:'wolai-icon-group-title'});
@@ -77,13 +101,13 @@ class IconPickerModal extends Modal{
       for(const e of g.list){const c=grid.createEl('button',{text:e,cls:'wolai-icon-cell'});c.onclick=()=>{this.icon={type:'emoji',emoji:e};input.value=e;this.updatePreview();};}
     }
   }
-  drawImage(b){
+  drawImage(b: HTMLElement){
     const imgs=this.app.vault.getFiles().filter(f=>ICON_IMAGE_EXTS.includes((f.extension||'').toLowerCase()));
     imgs.sort((x,y)=>(y.path.includes('_wolai/assets')?1:0)-(x.path.includes('_wolai/assets')?1:0)||x.path.localeCompare(y.path));
     const row=b.createDiv({cls:'wolai-icon-custom'});
     row.createSpan({text:'路径 / URL：'});
     const input=row.createEl('input',{type:'text',attr:{placeholder:'_wolai/assets/x.svg 或 https://…'}});
-    input.value=this.plugin.iconType(this.icon)==='image'?(this.icon.path||''):'';
+    input.value=this.plugin.iconType(this.icon)==='image'?(this.icon?.path||''):'';
     input.oninput=()=>{const v=input.value.trim();this.icon=v?{type:'image',path:v}:null;this.updatePreview();};
     b.createDiv({text:'vault 内图片（共 '+imgs.length+' 张，显示前 300）',cls:'wolai-icon-group-title'});
     const grid=b.createDiv({cls:'wolai-icon-grid wolai-icon-grid-img'});
@@ -94,43 +118,43 @@ class IconPickerModal extends Modal{
       c.onclick=()=>{this.icon={type:'image',path:f.path};input.value=f.path;this.updatePreview();};
     }
   }
-  drawDate(b){
-    const prev=this.plugin.iconType(this.icon)==='date'?this.icon:{};
+  drawDate(b: HTMLElement){
+    const prev: PageIcon = this.icon?.type === 'date' ? this.icon : {};
     const isToday=!prev.date||prev.date==='today';
     const row1=b.createDiv({cls:'wolai-icon-custom'});
-    const mk=(v,label)=>{const l=row1.createEl('label',{cls:'wolai-icon-radio'});const r=l.createEl('input',{type:'radio'});r.name='wolai-date-mode';r.checked=(v==='today')===isToday;l.createSpan({text:label});return r;};
+    const mk=(v: 'today' | 'fixed',label: string)=>{const l=row1.createEl('label',{cls:'wolai-icon-radio'});const r=l.createEl('input',{type:'radio'});r.name='wolai-date-mode';r.checked=(v==='today')===isToday;l.createSpan({text:label});return r;};
     const rToday=mk('today','今天（每天自动变）'),rFixed=mk('fixed','指定日期');
     const row2=b.createDiv({cls:'wolai-icon-custom'});
     row2.createSpan({text:'日期：'});
     const dateInput=row2.createEl('input',{type:'date'});
-    dateInput.value=isToday?window.moment().format('YYYY-MM-DD'):(prev.date||'');
+    dateInput.value=isToday?moment().format('YYYY-MM-DD'):(prev.date||'');
     row2.createSpan({text:'格式：'});
     const sel=row2.createEl('select');
     for(const f of ICON_DATE_FORMATS){const o=sel.createEl('option',{text:f});o.value=f;}
     const oCustom=sel.createEl('option',{text:'自定义…'});oCustom.value='';
-    const known=ICON_DATE_FORMATS.includes(prev.format);
-    sel.value=known?prev.format:'YYYY/MM/DD';
+    const known=prev.format !== undefined && ICON_DATE_FORMATS.includes(prev.format);
+    sel.value=known?(prev.format ?? ''):'YYYY/MM/DD';
     const custom=row2.createEl('input',{type:'text',attr:{placeholder:'moment 格式'}});
     custom.value=known?'':(prev.format||'');
-    custom.toggleClass('is-hidden',known);
+    custom.hidden = known;
     const sync=()=>{
       const mode=rToday.checked?'today':'fixed';
       const fmt=sel.value||custom.value.trim()||'YYYY/MM/DD';
       this.icon={type:'date',date:mode==='today'?'today':dateInput.value,format:fmt};
-      dateInput.toggleClass('is-hidden',mode==='today');
+      dateInput.hidden = mode === 'today';
       this.updatePreview();
     };
     rToday.onchange=sync;rFixed.onchange=sync;dateInput.onchange=sync;
-    sel.onchange=()=>{custom.toggleClass('is-hidden',!!sel.value);sync();};
+    sel.onchange=()=>{custom.hidden = !!sel.value;sync();};
     custom.oninput=sync;
     sync();
   }
-  drawElapsed(b){
-    const prev=this.plugin.iconType(this.icon)==='elapsed'?this.icon:{};
+  drawElapsed(b: HTMLElement){
+    const prev: PageIcon = this.icon?.type === 'elapsed' ? this.icon : {};
     const row1=b.createDiv({cls:'wolai-icon-custom'});
     row1.createSpan({text:'锚点日期：'});
     const dateInput=row1.createEl('input',{type:'date'});
-    dateInput.value=prev.date||window.moment().format('YYYY-MM-DD');
+    dateInput.value=prev.date||moment().format('YYYY-MM-DD');
     row1.createSpan({text:'单位：'});
     const unitSel=row1.createEl('select');
     for(const [v,t] of [['day','天'],['month','个月'],['year','年']]){const o=unitSel.createEl('option',{text:t});o.value=v;}
@@ -148,7 +172,11 @@ class IconPickerModal extends Modal{
     const sIn=row3.createEl('input',{type:'text',attr:{placeholder:'默认：天 / 个月 / 年'}});
     sIn.value=typeof prev.suffix==='string'?prev.suffix:'';
     const sync=()=>{
-      this.icon={type:'elapsed',date:dateInput.value,unit:unitSel.value,direction:dirSel.value};
+      const unit = unitSel.value;
+      const direction = dirSel.value;
+      this.icon = { type: 'elapsed', date: dateInput.value,
+        unit: unit === 'month' || unit === 'year' ? unit : 'day',
+        direction: direction === 'since' || direction === 'until' ? direction : 'auto' };
       if(pIn.value!=='')this.icon.prefix=pIn.value;
       if(sIn.value!=='')this.icon.suffix=sIn.value;
       this.updatePreview();
@@ -158,15 +186,20 @@ class IconPickerModal extends Modal{
   }
 }
 class ButtonBuilderModal extends Modal{
-  constructor(app,plugin,pagePath){
-    super(app);this.plugin=plugin;this.pagePath=pagePath;
-    this.name='';this.source='existing';
-    this.templates=plugin.listTemplates();
-    this.templatePath=this.templates[0]||'';
-    this.newTemplateName='';this.body='';
+  private name = '';
+  private source = 'existing';
+  private readonly templates: string[];
+  private templatePath: string;
+  private newTemplateName = '';
+  private body = '';
+
+  constructor(app: App, private readonly plugin: RendererPlugin, private readonly pagePath: string) {
+    super(app);
+    this.templates = plugin.listTemplates();
+    this.templatePath = this.templates[0] ?? '';
   }
   onOpen(){
-    const root=this.contentEl;root.addClass('wolai-button-builder');
+    const root=this.contentEl;root.addClass('wolai-button-builder');this.modalEl.addClass('wolai-modal-wide');
     root.createEl('h3',{text:'新建按钮'});
     root.createDiv({cls:'wolai-modal-hint',text:'按钮会插入到当前页面末尾；点击按钮即按所选动作执行。'});
     const f1=root.createDiv({cls:'wolai-field'});
@@ -176,7 +209,7 @@ class ButtonBuilderModal extends Modal{
     const f2=root.createDiv({cls:'wolai-field'});
     f2.createEl('label',{text:'点击动作'});
     const modeSel=f2.createEl('select');
-    for(const [v,t,dis] of [['page','新建页面（用模板生成新页面）',false],['inline','插入内容到折叠块（暂未开放）',true]]){
+    for(const [v,t,dis] of [['page','新建页面（用模板生成新页面）',false],['inline','插入内容到折叠块（暂未开放）',true]] as const){
       const o=modeSel.createEl('option',{text:t});o.value=v;o.disabled=dis;
     }
     modeSel.value='page';
@@ -206,12 +239,12 @@ class ButtonBuilderModal extends Modal{
         sel.onchange=()=>{this.templatePath=sel.value;};
         const view=holder.createEl('button',{text:'查看模板内容'});
         const pre=holder.createEl('pre',{cls:'wolai-template-preview'});
-        pre.addClass('is-hidden');
+        pre.hidden = true;
         view.onclick=async()=>{
-          if(!pre.hasClass('is-hidden')){pre.addClass('is-hidden');return;}
+          if(!pre.hidden){pre.hidden = true;return;}
           const f=this.app.vault.getAbstractFileByPath(this.templatePath);
           pre.setText(f instanceof TFile?await this.app.vault.read(f):'（文件缺失）');
-          pre.removeClass('is-hidden');
+          pre.hidden = false;
         };
       }else if(this.source==='new'){
         const r=holder.createDiv({cls:'wolai-field'});
@@ -244,7 +277,7 @@ class ButtonBuilderModal extends Modal{
     ok.onclick=async()=>{
       ok.disabled=true;
       try{
-        const cfg={name:this.name.trim()};
+        const cfg: TemplateBlock = { name: this.name.trim() };
         if(!cfg.name)throw new Error('请填写按钮名称');
         if(this.source==='existing'){
           if(!this.templatePath)throw new Error('请选择模板文件');
@@ -263,7 +296,7 @@ class ButtonBuilderModal extends Modal{
         await this.plugin.newButton(this.pagePath,cfg);
         new Notice('按钮已插入');
         this.close();
-      }catch(e){new Notice('插入失败：'+e.message);ok.disabled=false;}
+      }catch(e){new Notice('插入失败：'+errorMessage(e));ok.disabled=false;}
     };
     drawSource();
     nameIn.focus();
@@ -271,7 +304,14 @@ class ButtonBuilderModal extends Modal{
   onClose(){this.contentEl.empty();}
 }
 class PagesView extends ItemView {
-  constructor(leaf,plugin){super(leaf);this.plugin=plugin;this.expanded=new Set((plugin.data&&plugin.data.roots)||[]);this.query='';}
+  readonly expanded: Set<string>;
+  private query = '';
+  private renderRevision = 0;
+
+  constructor(leaf: WorkspaceLeaf, private readonly plugin: RendererPlugin) {
+    super(leaf);
+    this.expanded = new Set(plugin.data?.roots);
+  }
   getViewType(){return VIEW;}
   getDisplayText(){return '页面';}
   getIcon(){return 'panels-top-left';}
@@ -289,10 +329,10 @@ class PagesView extends ItemView {
       body.empty();
       if(this.plugin.error){this.plugin.errorBox(body,this.plugin.error,()=>this.plugin.reloadIndex());return;}
       if(!this.plugin.data){body.createDiv({text:'正在读取页面…',cls:'wolai-loading'});return;}
-      if(!this.plugin.data.roots.length){body.createDiv({text:'还没有导入页面。',cls:'wolai-loading'});const b=body.createEl('button',{text:'导入 wolai HTML 导出…',cls:'mod-cta'});b.onclick=()=>{if(this.plugin.openImport)this.plugin.openImport();};return;}
+      if(!this.plugin.data.roots.length){body.createDiv({text:'还没有导入页面。',cls:'wolai-loading'});const b=body.createEl('button',{text:'导入 wolai HTML 导出…',cls:'mod-cta'});b.onclick=()=>{this.plugin.openImport();};return;}
       const all=this.plugin.data.nodes;const q=this.query.toLocaleLowerCase();
-      const visible=(n)=>n.title.toLocaleLowerCase().includes(q)||this.plugin.visiblePagePaths(n.children||[]).some(p=>visible(all[p]));
-      const render=(path,depth)=>{
+      const visible=(n: IndexNode): boolean=>n.title.toLocaleLowerCase().includes(q)||this.plugin.visiblePagePaths(n.children||[]).some(p=>visible(all[p]));
+      const render=(path: string,depth: number)=>{
         const n=all[path];if(!n||q&&!visible(n))return;
         const row=body.createDiv({cls:'wolai-tree-row'});row.style.paddingLeft=(depth*15)+'px';
         const children=this.plugin.visiblePagePaths(n.children||[]);
@@ -315,11 +355,11 @@ class PagesView extends ItemView {
     };
     draw();
   }
-  contextMenu(path,event){
+  contextMenu(path: string,event: MouseEvent){
     const n=this.plugin.data?.nodes[path];if(!n)return;
     const menu=new Menu();
     menu.addItem(i=>i.setTitle(n.icon?'修改图标':'设置图标').setIcon('image-plus').onClick(()=>this.plugin.openIconPicker(path)));
-    if(n.icon)menu.addItem(i=>i.setTitle('移除图标').setIcon('trash').onClick(()=>this.plugin.setIcon(path,null).catch(e=>new Notice('移除失败：'+e.message))));
+    if(n.icon)menu.addItem(i=>i.setTitle('移除图标').setIcon('trash').onClick(()=>this.plugin.setIcon(path,null).catch(e=>new Notice('移除失败：'+errorMessage(e)))));
     menu.addSeparator();
     if(n.type==='page'||n.type==='record')menu.addItem(i=>i.setTitle('新建按钮').setIcon('mouse-pointer-click').onClick(()=>this.plugin.openButtonBuilder(path)));
     if(n.type==='page')menu.addItem(i=>i.setTitle('新建子页面').setIcon('plus').onClick(()=>this.plugin.newChild(path)));
@@ -328,42 +368,47 @@ class PagesView extends ItemView {
     menu.showAtMouseEvent(event);
   }
 }
-export class RendererPlugin extends Plugin {
+export abstract class RendererPlugin extends Plugin {
+  protected activeImport?: AbortSignal;
+  data: ConvertedIndex | null = null;
+  error: string | null = null;
+  private readonly bodyOrderCache = new Map<string, BodyCacheEntry>();
+  private pageDrag: PageDrag | null = null;
+
+  abstract openImport(): void;
   async onload(){
     this.data = null;
     this.error = null;
-    if(!Platform.isMobile)this.registerDomEvent(this.app.workspace.containerEl,'click',event=>{this.onBreadcrumbClick(event).catch(e=>{console.error('[wolai-local] 面包屑跳转失败',e);new Notice('页面跳转失败：'+e.message);});},true);
+    this.registerDomEvent(this.app.workspace.containerEl,'click',event=>{this.onBreadcrumbClick(event).catch(e=>{console.error('[wolai-local] 面包屑跳转失败',e);new Notice('页面跳转失败：'+errorMessage(e));});},true);
     this.registerView(VIEW,leaf=>new PagesView(leaf,this));
     this.addRibbonIcon('panels-top-left','页面导航',()=>this.reveal());
     this.addCommand({id:'open-pages',name:'打开页面导航',callback:()=>this.reveal()});
-    this.addCommand({id:'new-child',name:'新建子页面',checkCallback:checking=>{const f=this.app.workspace.getActiveFile();if(!f||!['page','record'].includes(this.data?.nodes[f.path]?.type))return false;if(!checking)this.newChild(f.path);return true;}});
+    this.addCommand({id:'new-child',name:'新建子页面',checkCallback:checking=>{const f=this.app.workspace.getActiveFile();if(!f||!['page','record'].includes(this.data?.nodes[f.path]?.type ?? ''))return false;if(!checking)this.newChild(f.path);return true;}});
     this.addCommand({id:'new-record',name:'新增表格记录',checkCallback:checking=>{const f=this.app.workspace.getActiveFile();if(!f||this.data?.nodes[f.path]?.type!=='database')return false;if(!checking)this.newRecord(f.path);return true;}});
     this.addCommand({id:'reload-index',name:'重新读取页面导航',callback:()=>this.reloadIndex()});
     this.addCommand({id:'set-icon',name:'设置当前页面图标',checkCallback:checking=>{const f=this.app.workspace.getActiveFile();if(!f||!this.data?.nodes[f.path])return false;if(!checking)this.openIconPicker(f.path);return true;}});
-    this.addCommand({id:'new-button',name:'新建按钮',checkCallback:checking=>{const f=this.app.workspace.getActiveFile();if(!f||!['page','record'].includes(this.data?.nodes[f.path]?.type))return false;if(!checking)this.openButtonBuilder(f.path);return true;}});
+    this.addCommand({id:'new-button',name:'新建按钮',checkCallback:checking=>{const f=this.app.workspace.getActiveFile();if(!f||!['page','record'].includes(this.data?.nodes[f.path]?.type ?? ''))return false;if(!checking)this.openButtonBuilder(f.path);return true;}});
     this.registerInterval(window.setInterval(()=>this.refreshDynamicIcons(),600000));
     this.registerMarkdownCodeBlockProcessor('wolai-columns',async(source,el,ctx)=>{
-      try{const columns=JSON.parse(source);if(!Array.isArray(columns)||columns.some(x=>!x||typeof x.markdown!=='string'||!Number.isFinite(x.weight)||x.weight<=0))throw new Error('分栏数据无效');
+      try{const columns=readColumns(source);
         const row=el.createDiv({cls:'wolai-columns'});const child=new MarkdownRenderChild(row);ctx.addChild(child);
-        for(const [index,item] of columns.entries()){const col=row.createDiv({cls:'wolai-column'});col.style.flexGrow=String(item.weight);const edit=col.createEl('button',{text:'编辑此栏',cls:'wolai-block-edit'});edit.onclick=()=>new MarkdownEditModal(this.app,'编辑分栏',item.markdown,async value=>{const next=JSON.parse(source);next[index].markdown=value;await this.replaceBlock(ctx,'wolai-columns',source,next);}).open();const content=col.createDiv();await MarkdownRenderer.render(this.app,item.markdown,content,ctx.sourcePath,child);this.wireTasks(content,item.markdown,async value=>{const next=JSON.parse(source);next[index].markdown=value;await this.replaceBlock(ctx,'wolai-columns',source,next);});}
-      }catch(e){this.errorBox(el,'无法读取分栏：'+e.message,()=>this.open(ctx.sourcePath));}
+        for(const [index,item] of columns.entries()){const col=row.createDiv({cls:'wolai-column'});col.style.flexGrow=String(item.weight);const edit=col.createEl('button',{text:'编辑此栏',cls:'wolai-block-edit'});edit.onclick=()=>new MarkdownEditModal(this.app,'编辑分栏',item.markdown,async value=>{const next=readColumns(source);next[index].markdown=value;await this.replaceBlock(ctx,'wolai-columns',source,next);}).open();const content=col.createDiv();await MarkdownRenderer.render(this.app,item.markdown,content,ctx.sourcePath,child);this.wireTasks(content,item.markdown,async value=>{const next=readColumns(source);next[index].markdown=value;await this.replaceBlock(ctx,'wolai-columns',source,next);});}
+      }catch(e){this.errorBox(el,'无法读取分栏：'+errorMessage(e),()=>this.open(ctx.sourcePath));}
     });
     this.registerMarkdownCodeBlockProcessor('wolai-toggle',async(source,el,ctx)=>{
-      try{const item=JSON.parse(source);if(typeof item.title!=='string'||typeof item.markdown!=='string')throw new Error('折叠内容无效');
+      try{const item=readToggle(source);
         const detail=el.createEl('details',{cls:'wolai-toggle'});detail.open=item.open===true;const summary=detail.createEl('summary');const content=detail.createDiv({cls:'wolai-toggle-body'});const child=new MarkdownRenderChild(detail);ctx.addChild(child);
-        await MarkdownRenderer.render(this.app,item.title,summary,ctx.sourcePath,child);await MarkdownRenderer.render(this.app,item.markdown,content,ctx.sourcePath,child);this.wireTasks(content,item.markdown,async value=>{const next=JSON.parse(source);next.markdown=value;await this.replaceBlock(ctx,'wolai-toggle',source,next);});
-      }catch(e){this.errorBox(el,'无法读取折叠内容：'+e.message,()=>this.open(ctx.sourcePath));}
+        await MarkdownRenderer.render(this.app,item.title,summary,ctx.sourcePath,child);await MarkdownRenderer.render(this.app,item.markdown,content,ctx.sourcePath,child);this.wireTasks(content,item.markdown,async value=>{const next=readToggle(source);next.markdown=value;await this.replaceBlock(ctx,'wolai-toggle',source,next);});
+      }catch(e){this.errorBox(el,'无法读取折叠内容：'+errorMessage(e),()=>this.open(ctx.sourcePath));}
     });
     this.registerMarkdownCodeBlockProcessor('wolai-styled',async(source,el,ctx)=>{
-      try{const item=JSON.parse(source);if(typeof item.markdown!=='string'||!Array.isArray(item.classes)||item.classes.some(c=>typeof c!=='string'||!/^wolai-export-[a-z0-9_-]+$/.test(c)))throw new Error('段落样式无效');
-        const content=el.createDiv({cls:item.classes.join(' ')});const child=new MarkdownRenderChild(content);ctx.addChild(child);await MarkdownRenderer.render(this.app,item.markdown,content,ctx.sourcePath,child);this.wireTasks(content,item.markdown,async value=>{const next=JSON.parse(source);next.markdown=value;await this.replaceBlock(ctx,'wolai-styled',source,next);});
-      }catch(e){this.errorBox(el,'无法读取段落：'+e.message,()=>this.open(ctx.sourcePath));}
+      try{const item=readStyled(source);
+        const content=el.createDiv({cls:item.classes.join(' ')});const child=new MarkdownRenderChild(content);ctx.addChild(child);await MarkdownRenderer.render(this.app,item.markdown,content,ctx.sourcePath,child);this.wireTasks(content,item.markdown,async value=>{const next=readStyled(source);next.markdown=value;await this.replaceBlock(ctx,'wolai-styled',source,next);});
+      }catch(e){this.errorBox(el,'无法读取段落：'+errorMessage(e),()=>this.open(ctx.sourcePath));}
     });
     this.registerMarkdownCodeBlockProcessor('wolai-image',async (source, el, ctx) => {
       try {
-        const item = JSON.parse(source);
-        if (typeof item.markdown !== 'string' || typeof item.caption !== 'string' || !['left', 'center', 'right'].includes(item.align)
-          || (item.width !== undefined && !/^\d+(?:\.\d+)?(?:px|%)$/.test(item.width))) throw new Error('图片版式无效');
+        const item = readImage(source);
         const figure = el.createEl('figure', { cls: `wolai-imported-figure wolai-figure-${item.align}` });
         if (item.width) figure.style.width = item.width;
         const child = new MarkdownRenderChild(figure);
@@ -371,13 +416,12 @@ export class RendererPlugin extends Plugin {
         await MarkdownRenderer.render(this.app, item.markdown, figure.createDiv({ cls: 'wolai-figure-media' }), ctx.sourcePath, child);
         if (item.caption) await MarkdownRenderer.render(this.app, item.caption, figure.createEl('figcaption'), ctx.sourcePath, child);
       } catch (error) {
-        this.errorBox(el, '无法读取图片：' + error.message, () => this.open(ctx.sourcePath));
+        this.errorBox(el, '无法读取图片：' + errorMessage(error), () => this.open(ctx.sourcePath));
       }
     });
     this.registerMarkdownCodeBlockProcessor('wolai-progress', (source, el) => {
       try {
-        const { value, max } = JSON.parse(source);
-        if (!Number.isFinite(max) || max <= 0 || !Number.isFinite(value) || value < 0 || value > max) throw new Error('无效的进度值');
+        const { value, max } = readProgress(source);
         const percentage = Math.round((100 * value / max) * 10) / 10;
         const progress = el.createDiv({ cls: 'wolai-export-progress', attr: {
           role: 'progressbar', 'aria-label': '完成进度', 'aria-valuemin': '0',
@@ -387,74 +431,74 @@ export class RendererPlugin extends Plugin {
         track.createDiv({ cls: 'wolai-export-progress-fill' }).style.width = `${percentage}%`;
         progress.createSpan({ text: `${percentage}%`, cls: 'wolai-export-progress-value', attr: { 'aria-hidden': 'true' } });
       } catch (error) {
-        el.createDiv({ cls: 'wolai-error', text: error.message });
+        el.createDiv({ cls: 'wolai-error', text: errorMessage(error) });
       }
     });
     this.registerMarkdownCodeBlockProcessor('wolai-table',async(source,el,ctx)=>{
       try{
-        const item=JSON.parse(source);
-        if(!Array.isArray(item.rows)||item.rows.some(row=>!Array.isArray(row)||row.some(cell=>!cell||typeof cell.markdown!=='string'||(cell.classes!==undefined&&(!Array.isArray(cell.classes)||cell.classes.some(c=>typeof c!=='string'||!/^wolai-export-[a-z0-9_-]+$/.test(c))))||(cell.width!==undefined&&(!Number.isFinite(cell.width)||cell.width<=0))||(cell.header!==undefined&&![true,false,'row','col'].includes(cell.header)))))throw new Error('表格单元格无效');
+        const item=readTable(source);
         const scroll=el.createDiv({cls:'wolai-content-table-scroll'});const table=scroll.createEl('table',{cls:'wolai-content-table'});const child=new MarkdownRenderChild(scroll);ctx.addChild(child);
         let leadingHeaders = 0;
         for (const row of item.rows) {
           if (!row.length || !row.every((cell) => cell.header === true || cell.header === 'col')) break;
           leadingHeaders++;
         }
-        if (item.rows.slice(0, leadingHeaders).some((row, i) => row.some((cell) => cell.rowspan > leadingHeaders - i))) leadingHeaders = 0;
+        if (item.rows.slice(0, leadingHeaders).some((row, i) => row.some((cell) => (cell.rowspan ?? 0) > leadingHeaders - i))) leadingHeaders = 0;
         const head = leadingHeaders ? table.createEl('thead') : null;
         const body = table.createEl('tbody');
         for(const [rowIndex,row] of item.rows.entries()){
-          const tr=(rowIndex < leadingHeaders ? head : body).createEl('tr');
+          const tr=(head && rowIndex < leadingHeaders ? head : body).createEl('tr');
           for(const [columnIndex,cell] of row.entries()){
             const td=tr.createEl(cell.header?'th':'td');
             if(cell.classes)td.addClasses(cell.classes);
             if(cell.header)td.scope=cell.header==='row'?'row':'col';
             if(cell.width!==undefined)td.style.minWidth=td.style.width=cell.width+'px';
-            if(['left','center','right','justify'].includes(cell.align))td.style.textAlign=cell.align;
-            if(Number.isInteger(cell.colspan)&&cell.colspan>1)td.colSpan=Math.min(cell.colspan,1000);
-            if(Number.isInteger(cell.rowspan)&&cell.rowspan>1)td.rowSpan=Math.min(cell.rowspan,65534);
+            if(cell.align)td.style.textAlign=cell.align;
+            if(cell.colspan !== undefined && Number.isInteger(cell.colspan)&&cell.colspan>1)td.colSpan=Math.min(cell.colspan,1000);
+            if(cell.rowspan !== undefined && Number.isInteger(cell.rowspan)&&cell.rowspan>1)td.rowSpan=Math.min(cell.rowspan,65534);
             const content=td.createDiv({cls:'wolai-content-table-cell'});await MarkdownRenderer.render(this.app,cell.markdown,content,ctx.sourcePath,child);
-            this.wireTasks(content,cell.markdown,async value=>{const next=JSON.parse(source);next.rows[rowIndex][columnIndex].markdown=value;await this.replaceBlock(ctx,'wolai-table',source,next);});
+            this.wireTasks(content,cell.markdown,async value=>{const next=readTable(source);next.rows[rowIndex][columnIndex].markdown=value;await this.replaceBlock(ctx,'wolai-table',source,next);});
           }
         }
-      }catch(e){this.errorBox(el,'无法读取内容表格：'+e.message,()=>this.open(ctx.sourcePath));}
+      }catch(e){this.errorBox(el,'无法读取内容表格：'+errorMessage(e),()=>this.open(ctx.sourcePath));}
     });
     this.registerMarkdownCodeBlockProcessor('wolai-table-source', (source, el) => {
       try {
-        const { url } = JSON.parse(source);
+        const { url } = readBlockObject(source, '链接无效');
         if (typeof url !== 'string' || !/^https?:\/\/www\.wolai\.com\/[a-z0-9]+(?:#\w+)?\/?$/i.test(url)) throw new Error('链接无效');
         const card = el.createDiv({ cls: 'wolai-workbook' });
         card.createEl('strong', { text: 'wolai 多维表格' });
         card.createEl('p', { cls: 'wolai-workbook-note', text: '这份 HTML 只包含原表链接。' });
         card.createEl('a', { text: '在 wolai 打开原表', href: url, cls: 'external-link', attr: { rel: 'noopener' } });
       } catch (error) {
-        el.createDiv({ cls: 'wolai-error', text: '无法显示原表链接：' + error.message });
+        el.createDiv({ cls: 'wolai-error', text: '无法显示原表链接：' + errorMessage(error) });
       }
     });
     this.registerMarkdownCodeBlockProcessor('wolai-workbook', (source, el, ctx) => this.renderWorkbook(source, el, ctx));
     this.registerMarkdownCodeBlockProcessor('wolai-database',async(source,el,ctx)=>{
-      try{const item=JSON.parse(source);const node=this.data?.nodes[item.base];if(!node||node.type!=='database'||!node.schema)throw new Error('原始表格字段尚未核验');
+      try{const item=readDatabaseForm(source);const node=this.data?.nodes[item.base];if(!node||node.type!=='database'||!node.schema)throw new Error('原始表格字段尚未核验');
         const toolbar=el.createDiv({cls:'wolai-database-tabs'});const content=el.createDiv();const child=new MarkdownRenderChild(content);ctx.addChild(child);const formTab=toolbar.createEl('button',{text:item.form.name});const tableTab=toolbar.createEl('button',{text:'表格视图'});
-        const draw=async view=>{content.empty();formTab.toggleClass('is-active',view==='form');tableTab.toggleClass('is-active',view==='table');if(view==='table'){await MarkdownRenderer.render(this.app,'![[ '+item.base+' ]]'.replace('![[ ','![[').replace(' ]]',']]'),content,ctx.sourcePath,child);return;}
-          const form=content.createEl('form',{cls:'wolai-record-form'});form.createEl('h2',{text:item.form.name});const inputs={};
-          for(const name of item.form.fields){const col=node.schema.find(c=>c.name===name);if(!col||!['number','date','text','primary','phone','url'].includes(col.type))throw new Error('表单字段定义无效：'+name);const label=form.createEl('label',{text:name});const input=label.createEl('input',{type:col.type==='number'?'number':col.type==='date'?'date':'text'});if(col.type==='number')input.step='any';inputs[name]={input,type:col.type};}
+        const schema = node.schema;
+        const draw=async (view: 'form' | 'table')=>{content.empty();formTab.toggleClass('is-active',view==='form');tableTab.toggleClass('is-active',view==='table');if(view==='table'){await MarkdownRenderer.render(this.app,'![[ '+item.base+' ]]'.replace('![[ ','![[').replace(' ]]',']]'),content,ctx.sourcePath,child);return;}
+          const form=content.createEl('form',{cls:'wolai-record-form'});form.createEl('h2',{text:item.form.name});const inputs = new Map<string, { input: HTMLInputElement; type: string }>();
+          for(const name of item.form.fields){const col=schema.find(c=>c.name===name);if(!col||!['number','date','text','primary','phone','url'].includes(col.type))throw new Error('表单字段定义无效：'+name);const label=form.createEl('label',{text:name});const input=label.createEl('input',{type:col.type==='number'?'number':col.type==='date'?'date':'text'});if(col.type==='number')input.step='any';inputs.set(name, {input,type:col.type});}
           const submit=form.createEl('button',{text:'提交表单',cls:'mod-cta',type:'submit'});const error=form.createDiv({cls:'wolai-form-status'});
-          form.onsubmit=async event=>{event.preventDefault();submit.disabled=true;error.setText('正在保存…');try{const values={};for(const [name,{input,type}] of Object.entries(inputs)){if(!input.value)values[name]=null;else if(type==='number'){const number=Number(input.value);if(!Number.isFinite(number))throw new Error(name+'需要有效数字');values[name]=number;}else values[name]=input.value;}
-            await this.createFormRecord(node,values);form.reset();error.setText('已保存到本地表格');new Notice('记录已保存');}catch(e){error.setText('保存失败：'+e.message);}finally{submit.disabled=false;}};
-        };formTab.onclick=()=>draw('form').catch(e=>this.errorBox(content,e.message,()=>draw('form')));tableTab.onclick=()=>draw('table').catch(e=>this.errorBox(content,e.message,()=>draw('table')));await draw(item.defaultView);
-      }catch(e){this.errorBox(el,'无法读取表格：'+e.message,()=>this.reloadIndex());}
+          form.onsubmit=async event=>{event.preventDefault();submit.disabled=true;error.setText('正在保存…');try{const values = new Map<string, RecordValue>();for(const [name,{input,type}] of inputs){if(!input.value)values.set(name, null);else if(type==='number'){const number=Number(input.value);if(!Number.isFinite(number))throw new Error(name+'需要有效数字');values.set(name, number);}else values.set(name, input.value);}
+            await this.createFormRecord(node,values);form.reset();error.setText('已保存到本地表格');new Notice('记录已保存');}catch(e){error.setText('保存失败：'+errorMessage(e));}finally{submit.disabled=false;}};
+        };formTab.onclick=()=>draw('form').catch(e=>this.errorBox(content,errorMessage(e),()=>draw('form')));tableTab.onclick=()=>draw('table').catch(e=>this.errorBox(content,errorMessage(e),()=>draw('table')));await draw(item.defaultView);
+      }catch(e){this.errorBox(el,'无法读取表格：'+errorMessage(e),()=>this.reloadIndex());}
     });
     this.registerMarkdownCodeBlockProcessor('wolai-template',async(source,el,ctx)=>{
-      try{const t=JSON.parse(source);if(typeof t.name!=='string'||typeof t.template!=='string')throw new Error('模板定义无效');
+      try{const t=readTemplate(source);
         const btn=el.createEl('button',{text:t.name,cls:'wolai-template-button'});
-        btn.onclick=async()=>{btn.disabled=true;try{await this.applyTemplate(t,ctx);}catch(e){new Notice('模板创建失败：'+e.message);}finally{btn.disabled=false;}};
-      }catch(e){this.errorBox(el,e.message,()=>this.reloadIndex());}
+        btn.onclick=async()=>{btn.disabled=true;try{await this.applyTemplate(t,ctx);}catch(e){new Notice('模板创建失败：'+errorMessage(e));}finally{btn.disabled=false;}};
+      }catch(e){this.errorBox(el,errorMessage(e),()=>this.reloadIndex());}
     });
     this.registerMarkdownPostProcessor((el,ctx)=>this.decorateSection(el,ctx));
     this.registerEvent(this.app.workspace.on('file-open',()=>{this.refreshViews();this.decorateOpenViews();}));
-    this.registerEvent(this.app.vault.on('modify',file=>{const node=this.data?.nodes[file.path];if(node?.type==='database'&&node.computedView)this.syncComputedView(node).catch(e=>new Notice(e.message));}));
+    this.registerEvent(this.app.vault.on('modify',file=>{const node=this.data?.nodes[file.path];if(node?.type==='database'&&node.computedView)this.syncComputedView(node).catch(e=>new Notice(errorMessage(e)));}));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-      this.handleRename(file.path, oldPath).catch((error) => new Notice('页面目录保存失败：' + error.message));
+      this.handleRename(file.path, oldPath).catch((error) => new Notice('页面目录保存失败：' + errorMessage(error)));
     }));
     this.registerEvent(this.app.vault.on('delete',file=>{
       if(!this.data)return;
@@ -462,17 +506,20 @@ export class RendererPlugin extends Plugin {
       if(!deleted.size)return;
       const parents=Object.values(this.data.nodes).filter(n=>n.children?.some(p=>deleted.has(p))&&!deleted.has(n.path)).map(n=>n.path);
       for(const path of deleted)this.removeIndexNode(path);
-      this.saveData(this.data).catch(e=>new Notice('页面目录保存失败：'+e.message));this.refreshViews();
+      this.saveData(this.data).catch(e=>new Notice('页面目录保存失败：'+errorMessage(e)));this.refreshViews();
       if(file instanceof TFile)this.cleanupDeletedPage(file,parents).catch(e=>console.error('[wolai-local] 删除后清理失败',e));
     }));
     this.registerEvent(this.app.metadataCache.on('changed',(file,text,cache)=>{
       this.bodyOrderCache?.delete(file.path);
-      const node=this.data?.nodes[file.path];if(!node)return;
-      const db=this.data.nodes[node.databasePath];const primary=db?.schema?.find(c=>c.type==='primary');
-      const value=node.type==='record'&&primary?cache.frontmatter?.[primary.name]:text.match(/^# (.+)$/m)?.[1];
+      const data = this.data;
+      const node = data?.nodes[file.path];
+      if (!data || !node) return;
+      const db = node.databasePath ? data.nodes[node.databasePath] : undefined;
+      const primary = db?.schema?.find((column) => column.type === 'primary');
+      const value: unknown = node.type === 'record' && primary ? cache.frontmatter?.[primary.name] : text.match(/^# (.+)$/m)?.[1];
       let changed=this.syncBodyChildOrder(file.path,text);
       if(typeof value==='string'&&value.trim()&&value!==node.title){node.title=value;changed=true;}
-      if(changed)this.saveData(this.data).then(()=>this.refreshViews()).catch(e=>new Notice('页面目录保存失败：'+e.message));
+      if(changed)this.saveData(data).then(()=>this.refreshViews()).catch(e=>new Notice('页面目录保存失败：'+errorMessage(e)));
     }));
     await this.reloadIndex();
     this.app.workspace.onLayoutReady(() => {
@@ -480,20 +527,21 @@ export class RendererPlugin extends Plugin {
       this.redrawOpenViews();
     });
   }
-  onunload(){this.clearPageDrag();for(const leaf of this.app.workspace.getLeavesOfType('markdown')){leaf.view.containerEl.removeClass('wolai-view','wolai-record','wolai-full-width','wolai-small-text','wolai-export-layout');leaf.view.containerEl.querySelectorAll('.wolai-header,.wolai-actions,.wolai-insert-page,.wolai-page-drag-handle,.wolai-page-drop-zone').forEach(el=>el.remove());leaf.view.containerEl.querySelectorAll('.wolai-page-block').forEach(el=>{el.removeClass('wolai-page-block');delete el.dataset.wolaiPositions;});}}
-  async handleRename(newPath, oldPath) {
+  onunload(){this.clearPageDrag();for(const leaf of this.app.workspace.getLeavesOfType('markdown')){leaf.view.containerEl.removeClass('wolai-view','wolai-record','wolai-full-width','wolai-small-text','wolai-export-layout');leaf.view.containerEl.querySelectorAll('.wolai-header,.wolai-actions,.wolai-insert-page,.wolai-page-drag-handle,.wolai-page-drop-zone').forEach(el=>el.remove());leaf.view.containerEl.querySelectorAll<HTMLElement>('.wolai-page-block').forEach(el=>{el.removeClass('wolai-page-block');delete el.dataset.wolaiPositions;});}}
+  async handleRename(newPath: string, oldPath: string) {
     if (!this.data) return;
-    const moved = (path) => typeof path === 'string' && (path === oldPath || path.startsWith(oldPath + '/'))
+    const moved = (path: string) => (path === oldPath || path.startsWith(oldPath + '/'))
       ? newPath + path.slice(oldPath.length) : path;
     let changed = false;
-    const nodes = {};
+    const nodes: Record<string, IndexNode> = {};
     for (const [path, node] of Object.entries(this.data.nodes)) {
-      const next = { ...node, path: moved(path), children: node.children?.map(moved) };
+      const next = { ...node, path: moved(path), children: node.children.map(moved) };
       changed ||= next.path !== path;
-      for (const key of ['databasePath', 'computedView', 'recordsFolder', 'cover']) {
-        if (node[key]) {
-          next[key] = moved(node[key]);
-          changed ||= next[key] !== node[key];
+      for (const key of ['databasePath', 'computedView', 'recordsFolder', 'cover'] as const) {
+        const current = node[key];
+        if (current) {
+          next[key] = moved(current);
+          changed ||= next[key] !== current;
         }
       }
       if (node.icon?.path && moved(node.icon.path) !== node.icon.path) {
@@ -511,14 +559,16 @@ export class RendererPlugin extends Plugin {
     this.decorateOpenViews();
   }
 
-  removeIndexNode(path) {
-    delete this.data.nodes[path];
-    for (const node of Object.values(this.data.nodes)) {
-      if (Array.isArray(node.children)) node.children = node.children.filter((child) => child !== path);
+  removeIndexNode(path: string) {
+    const data = this.data;
+    if (!data) return;
+    delete data.nodes[path];
+    for (const node of Object.values(data.nodes)) {
+      node.children = node.children.filter((child) => child !== path);
     }
-    this.data.roots = this.data.roots.filter((root) => root !== path);
-    for (const [id, owner] of Object.entries(this.data.blockPaths)) {
-      if (owner === path) delete this.data.blockPaths[id];
+    data.roots = data.roots.filter((root) => root !== path);
+    for (const [id, owner] of Object.entries(data.blockPaths)) {
+      if (owner === path) delete data.blockPaths[id];
     }
   }
 
@@ -528,13 +578,11 @@ export class RendererPlugin extends Plugin {
 
   async reloadIndex() {
     try {
-      const saved = await this.loadData();
-      const index = saved ?? { version: 1, roots: [], nodes: {}, blockPaths: {} };
-      this.validateIndex(index);
-      this.data = restrictIndexToImports(index);
+      const saved: unknown = await this.loadData();
+      this.data = restrictIndexToImports(readImportIndex(saved));
       this.error = null;
     } catch (error) {
-      this.error = '无法读取页面目录：' + error.message;
+      this.error = '无法读取页面目录：' + errorMessage(error);
       new Notice(this.error);
     }
     this.refreshViews();
@@ -542,32 +590,23 @@ export class RendererPlugin extends Plugin {
     this.refreshMissingPageLinks();
   }
 
-  expandRoot(path) {
+  expandRoot(path: string) {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW)) {
       if (leaf.view instanceof PagesView) leaf.view.expanded.add(path);
     }
   }
 
-  validateIndex(data){
-    if(!data||data.version!==1||!Array.isArray(data.roots)||!data.nodes||typeof data.nodes!=='object'||Array.isArray(data.nodes))throw new Error('页面索引缺失或格式错误');
-    const hasNode=p=>typeof p==='string'&&Object.prototype.hasOwnProperty.call(data.nodes,p);
-    for(const [path,n] of Object.entries(data.nodes)){
-      if(!n||n.path!==path||typeof n.title!=='string'||n.children!=null&&!Array.isArray(n.children))throw new Error('页面定义不完整：'+path);
-      for(const child of n.children||[])if(!hasNode(child))throw new Error('子页面定义缺失：'+child);
-    }
-    for(const root of data.roots)if(!hasNode(root))throw new Error('根页面定义缺失：'+root);
-  }
-  async saveData(data){
-    this.validateIndex(data);
+  async saveData(data: ConvertedIndex) {
+    validateIndexReferences(data);
     await super.saveData(data);
   }
-  errorBox(el,message,retry){el.empty();el.createDiv({text:message,cls:'wolai-error'});const b=el.createEl('button',{text:'重试'});b.onclick=retry;}
-  refreshViews(){for(const leaf of this.app.workspace.getLeavesOfType(VIEW))if(leaf.view instanceof PagesView)leaf.view.render().catch(e=>{console.error('Wolai 页面导航刷新失败',e);new Notice('页面导航刷新失败：'+e.message+'。请重新打开页面导航后重试。');});}
-  async reveal(focus=true){let leaf=this.app.workspace.getLeavesOfType(VIEW)[0];if(!leaf){leaf=this.app.workspace.getLeftLeaf(false);if(!leaf)return;await leaf.setViewState({type:VIEW,active:focus});}if(focus){if(typeof leaf.loadIfDeferred==='function')await leaf.loadIfDeferred();await this.app.workspace.revealLeaf(leaf);}}
-  async renderWorkbook(source, el, ctx) {
+  errorBox(el: HTMLElement,message: string,retry: () => void | Promise<unknown>){el.empty();el.createDiv({text:message,cls:'wolai-error'});const b=el.createEl('button',{text:'重试'});b.onclick=retry;}
+  refreshViews(){for(const leaf of this.app.workspace.getLeavesOfType(VIEW))if(leaf.view instanceof PagesView)leaf.view.render().catch(e=>{console.error('Wolai 页面导航刷新失败',e);new Notice('页面导航刷新失败：'+errorMessage(e)+'。请重新打开页面导航后重试。');});}
+  async reveal(focus=true){let leaf: WorkspaceLeaf | null | undefined = this.app.workspace.getLeavesOfType(VIEW)[0];if(!leaf){leaf=this.app.workspace.getLeftLeaf(false);if(!leaf)return;await leaf.setViewState({type:VIEW,active:focus});}if(focus){if(typeof leaf.loadIfDeferred==='function')await leaf.loadIfDeferred();await this.app.workspace.revealLeaf(leaf);}}
+  async renderWorkbook(source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) {
     const card = el.createDiv({ cls: 'wolai-workbook' });
     try {
-      const { path, name } = JSON.parse(source);
+      const { path, name } = readBlockObject(source, 'Excel 附件定义无效');
       if (typeof path !== 'string' || !/\.xlsx$/i.test(path) || typeof name !== 'string') throw new Error('Excel 附件定义无效');
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof TFile)) throw new Error('Excel 附件未找到');
@@ -577,10 +616,11 @@ export class RendererPlugin extends Plugin {
       const attachment = heading.createEl('a', { text: '打开附件', cls: 'internal-link', attr: { 'data-href': path, href: path } });
       attachment.onclick = (event) => {
         event.preventDefault();
-        this.app.workspace.openLinkText(path, ctx.sourcePath, false);
+        this.app.workspace.openLinkText(path, ctx.sourcePath, false)
+          .catch((error: unknown) => new Notice('无法打开附件：' + errorMessage(error)));
       };
       const content = card.createDiv();
-      let workbook;
+      let workbook: ReturnType<typeof openWorkbook> | undefined;
       preview.onclick = async () => {
         if (!content.hidden && workbook) {
           content.hidden = true;
@@ -600,16 +640,16 @@ export class RendererPlugin extends Plugin {
           preview.setText('收起预览');
         } catch (error) {
           workbook = undefined;
-          content.setText('Excel 预览失败：' + error.message);
+          content.setText('Excel 预览失败：' + errorMessage(error));
         } finally {
           preview.disabled = false;
         }
       };
     } catch (error) {
-      card.createDiv({ cls: 'wolai-error', text: error.message });
+      card.createDiv({ cls: 'wolai-error', text: errorMessage(error) });
     }
   }
-  drawWorkbook(workbook, content) {
+  drawWorkbook(workbook: ReturnType<typeof openWorkbook>, content: HTMLElement) {
     content.empty();
     const toolbar = content.createDiv({ cls: 'wolai-workbook-controls' });
     const select = toolbar.createEl('select', { attr: { 'aria-label': 'Excel 工作表' } });
@@ -645,7 +685,7 @@ export class RendererPlugin extends Plugin {
           for (let column = 1; column <= columns; column++) row.createEl('td', { text: cells.get(column) ?? '' });
         }
       } catch (error) {
-        status.setText(error.message);
+        status.setText(errorMessage(error));
         previous.disabled = next.disabled = true;
       }
     };
@@ -655,22 +695,52 @@ export class RendererPlugin extends Plugin {
     content.createEl('p', { cls: 'wolai-workbook-note', text: '只读预览使用文件中已保存的值。完整格式和公式请查看原附件。' });
     render();
   }
-  wireTasks(container,markdown,save){
+  wireTasks(container: HTMLElement, markdown: string, save: TextAction) {
     container.setAttribute('data-wolai-task-scope', '');
-    const matches=[...markdown.matchAll(/^\s*[-*+] \[([ xX])\]/gm)];
-    const inputs=[...container.querySelectorAll('input.task-list-item-checkbox')]
+    const matches = [...markdown.matchAll(/^\s*[-*+] \[([ xX])\]/gm)];
+    const inputs = [...container.querySelectorAll<HTMLInputElement>('input.task-list-item-checkbox')]
       .filter((input) => input.closest('[data-wolai-task-scope]') === container);
-    if(!inputs.length)return;if(matches.length!==inputs.length){for(const input of inputs){input.disabled=true;input.title='任务位置无法唯一核验，请在编辑模式修改';}return;}
-    inputs.forEach((input,index)=>{input.disabled=false;input.addEventListener('click',async event=>{event.preventDefault();event.stopImmediatePropagation();const checked=input.checked;input.disabled=true;const match=matches[index];const at=match.index+match[0].lastIndexOf('[')+1;const next=markdown.slice(0,at)+(checked?'x':' ')+markdown.slice(at+1);try{await save(next);input.checked=checked;}catch(e){new Notice('任务保存失败：'+e.message);}finally{input.disabled=false;}},true);});
+    if (!inputs.length) return;
+    if (matches.length !== inputs.length) {
+      for (const input of inputs) {
+        input.disabled = true;
+        input.title = '任务位置无法唯一核验，请在编辑模式修改';
+      }
+      return;
+    }
+
+    inputs.forEach((input, index) => {
+      const saveChecked = async () => {
+        const checked = input.checked;
+        input.disabled = true;
+        const match = matches[index];
+        const at = match.index + match[0].lastIndexOf('[') + 1;
+        const next = markdown.slice(0, at) + (checked ? 'x' : ' ') + markdown.slice(at + 1);
+        try {
+          await save(next);
+          input.checked = checked;
+        } catch (error) {
+          new Notice('任务保存失败：' + errorMessage(error));
+        } finally {
+          input.disabled = false;
+        }
+      };
+      input.disabled = false;
+      input.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        void saveChecked();
+      }, true);
+    });
   }
-  async replaceBlock(ctx, kind, source, value) {
+  async replaceBlock(ctx: MarkdownPostProcessorContext, kind: string, source: string, value: unknown) {
     const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
     if (!(file instanceof TFile)) throw new Error('页面文件缺失');
     await this.app.vault.process(file, (text) => {
       let matches = 0;
-      const replace = (markdown) => markdown.replace(/^([ \t]*)```(wolai-[a-z-]+)[ \t]*\r?\n([\s\S]*?)^\1```[ \t]*(?=\r?$)/gm, (fence, spaces, block, raw) => {
+      const replace = (markdown: string): string => markdown.replace(/^([ \t]*)```(wolai-[a-z-]+)[ \t]*\r?\n([\s\S]*?)^\1```[ \t]*(?=\r?$)/gm, (fence: string, spaces: string, block: string, raw: string) => {
         const body = raw.split(/\r?\n/).map((line) => line.startsWith(spaces) ? line.slice(spaces.length) : line).join('\n').trimEnd();
-        const format = (data) => `${spaces}\`\`\`${block}\n${spaces}${JSON.stringify(data)}\n${spaces}\`\`\``;
+        const format = (data: unknown) => `${spaces}\`\`\`${block}\n${spaces}${JSON.stringify(data)}\n${spaces}\`\`\``;
         if (block === kind && body === source.trimEnd()) {
           matches++;
           return format(value);
@@ -678,7 +748,7 @@ export class RendererPlugin extends Plugin {
         if (!['wolai-toggle', 'wolai-columns', 'wolai-table', 'wolai-styled'].includes(block)) return fence;
         const previous = matches;
         try {
-          const data = JSON.parse(body, (key, item) => key === 'markdown' && typeof item === 'string' ? replace(item) : item);
+          const data: unknown = JSON.parse(body, (key: string, item: unknown) => key === 'markdown' && typeof item === 'string' ? replace(item) : item);
           return matches === previous ? fence : format(data);
         } catch {
           return fence;
@@ -689,34 +759,43 @@ export class RendererPlugin extends Plugin {
       return modified;
     });
   }
-  async open(path,leaf){const f=this.app.vault.getAbstractFileByPath(path);if(!(f instanceof TFile)){new Notice('页面文件缺失，无法打开：'+path);return;}leaf??=this.app.workspace.getLeaf(false);await leaf.openFile(f);if(f.extension==='md')await leaf.setViewState({type:'markdown',state:{file:f.path,mode:'preview'}});}
-  async onBreadcrumbClick(event){
+  async open(path: string,leaf?: WorkspaceLeaf | null){const f=this.app.vault.getAbstractFileByPath(path);if(!(f instanceof TFile)){new Notice('页面文件缺失，无法打开：'+path);return;}leaf??=this.app.workspace.getLeaf(false);await leaf.openFile(f);if(f.extension==='md')await leaf.setViewState({type:'markdown',state:{file:f.path,mode:'preview'}});}
+  async onBreadcrumbClick(event: MouseEvent){
     if(event.defaultPrevented||event.button!==0||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)return;
-    const crumb=event.target?.closest?.('.view-header-breadcrumb');if(!crumb)return;
-    const leaf=this.app.workspace.getLeavesOfType('markdown').find(leaf=>leaf.view.headerEl.contains(crumb));if(!leaf)return;
-    const view=leaf.view,file=view.file;if(!this.data?.nodes[file?.path])return;
-    const crumbs=Array.from(view.titleParentEl.querySelectorAll('.view-header-breadcrumb'));const index=crumbs.indexOf(crumb);if(index<0)return;
-    const folder=file.parent.path.split('/').slice(0,index+1).join('/');
+    const target = event.target;
+    if (!isDomNode(target) || !target.instanceOf(Element)) return;
+    const crumb = target.closest('.view-header-breadcrumb');
+    if (!crumb) return;
+    const leaf = this.app.workspace.getLeavesOfType('markdown')
+      .find((leaf) => leaf.view instanceof MarkdownView && leaf.view.containerEl.contains(crumb));
+    if (!leaf || !(leaf.view instanceof MarkdownView)) return;
+    const { file, containerEl } = leaf.view;
+    if (!this.data || !file || !this.data.nodes[file.path]) return;
+    const crumbs = Array.from(containerEl.querySelectorAll('.view-header-breadcrumb'));
+    const index = crumbs.indexOf(crumb);
+    if (index < 0) return;
+    const folder = file.parent?.path.split('/').slice(0, index + 1).join('/');
+    if (!folder) return;
     const pages=Object.values(this.data.nodes).filter(node=>node.type==='page'&&node.path.slice(0,node.path.lastIndexOf('/'))===folder);
     const page=pages.find(node=>node.path===folder+'/'+folder.split('/').pop()+'.md')||(pages.length===1?pages[0]:null);if(!page)return;
     event.preventDefault();event.stopImmediatePropagation();
     await this.open(page.path,leaf);await this.reveal();this.app.workspace.setActiveLeaf(leaf,{focus:true});this.refreshViews();
   }
-  iconType(icon){
+  iconType(icon?: PageIcon | null): PageIcon['type'] | null{
     if(!icon||typeof icon!=='object')return null;
-    if(['emoji','image','date','elapsed'].includes(icon.type))return icon.type;
+    if(icon.type)return icon.type;
     if(icon.emoji)return 'emoji';
     if(icon.path)return 'image';
     return null;
   }
-  iconImageSrc(icon){
+  iconImageSrc(icon: PageIcon){
     const p=icon?.path;if(!p)return null;
     if(/^https?:\/\//i.test(p))return p;
     const f=this.app.vault.getAbstractFileByPath(p)||this.app.vault.getAbstractFileByPath(p.replace(/^\//,''));
     return f instanceof TFile?this.app.vault.getResourcePath(f):null;
   }
-  iconDynamicText(icon,opts){
-    const m=window.moment,compact=!!(opts&&opts.compact);
+  iconDynamicText(icon: PageIcon,opts?: { compact?: boolean }){
+    const m=moment,compact=!!(opts&&opts.compact);
     if(icon.type==='date'){
       const d=(!icon.date||icon.date==='today')?m():m(icon.date,'YYYY-MM-DD',true);
       if(!d.isValid())return '⚠';
@@ -735,8 +814,8 @@ export class RendererPlugin extends Plugin {
     const suffix=typeof icon.suffix==='string'?icon.suffix:({day:'天',month:'个月',year:'年'}[unit]||'');
     return prefix+value+suffix;
   }
-  iconCalendarModel(icon){
-    const m=window.moment;
+  iconCalendarModel(icon: PageIcon): CalendarModel | null{
+    const m=moment;
     if(icon.type==='date'){
       const d=(!icon.date||icon.date==='today')?m():m(icon.date,'YYYY-MM-DD',true);
       if(!d.isValid())return null;
@@ -755,8 +834,8 @@ export class RendererPlugin extends Plugin {
     const suffix=typeof icon.suffix==='string'?icon.suffix:unitWord;
     return {year:d.format('YYYY'),monthDay:d.format('MM-DD'),big:String(value),desc:(prefix.trim()+suffix).trim()};
   }
-  calendarSvg(model){
-    const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  calendarSvg(model: CalendarModel, doc: Document){
+    const esc=(s: string)=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const big=String(model.big==null?'':model.big);
     const bigSize=big.length>4?Math.max(96,Math.round(200*4/big.length)):200;
     const font="font-family=\"-apple-system, BlinkMacSystemFont, 'Noto Sans', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif, 'Segoe UI', Roboto, 'Helvetica Neue', Arial\"";
@@ -768,17 +847,17 @@ export class RendererPlugin extends Plugin {
       +'<text id="month-day" x="54.3030303" y="159.575758" fill="#FFFFFF" '+font+' font-size="77.5757576" font-weight="normal">'+esc(model.monthDay)+'</text>'
       +'<text id="desc" x="458" y="153.090909" fill="#FFFFFF" '+font+' font-size="62.0606061" font-weight="normal" text-anchor="end">'+esc(model.desc)+'</text>'
       +'</svg>';
-    try{return document.importNode(new DOMParser().parseFromString(svg,'image/svg+xml').documentElement,true);}catch(e){return null;}
+    try{return doc.importNode(new DOMParser().parseFromString(svg,'image/svg+xml').documentElement,true);}catch{return null;}
   }
-  renderIcon(el,icon,fallback,opts){
+  renderIcon(el: HTMLElement,icon: PageIcon | null | undefined,fallback: string,opts?: { compact?: boolean }){
     const type=this.iconType(icon);
-    if(type==='emoji'){el.setText(icon.emoji);return;}
-    if(type==='image'){
+    if(type==='emoji' && icon){el.setText(icon.emoji ?? '');return;}
+    if(type==='image' && icon){
       const src=this.iconImageSrc(icon);
       if(src){el.createEl('img',{attr:{src,alt:''}});return;}
       el.setText('⚠');el.title='图标文件缺失';return;
     }
-    if(type==='date'||type==='elapsed'){
+    if(icon && (type==='date'||type==='elapsed')){
       const compact=!!(opts&&opts.compact);
       el.dataset.wolaiIcon=JSON.stringify(icon);
       el.dataset.wolaiIconCompact=compact?'1':'0';
@@ -788,32 +867,40 @@ export class RendererPlugin extends Plugin {
     }
     setIcon(el,fallback);
   }
-  paintDynamicIcon(el,icon,compact){
+  paintDynamicIcon(el: HTMLElement,icon: PageIcon,compact: boolean){
     const text=this.iconDynamicText(icon,{compact});
     const model=icon.style==='text'?null:this.iconCalendarModel(icon);
-    const svg=model?this.calendarSvg(model):null;
+    const svg=model?this.calendarSvg(model, el.doc):null;
     el.empty();
     el.title=this.iconDynamicText(icon);
     el.toggleClass('wolai-icon-calendar',!!svg);
     if(svg){el.appendChild(svg);return;}
     el.setText(text||'⚠');
   }
-  refreshDynamicIcons(){
-    for(const el of document.querySelectorAll('[data-wolai-icon]')){
-      try{
-        const icon=JSON.parse(el.dataset.wolaiIcon);
-        const compact=el.dataset.wolaiIconCompact==='1';
-        const model=icon.style==='text'?null:this.iconCalendarModel(icon);
-        const sig=JSON.stringify(model||this.iconDynamicText(icon,{compact}));
-        if(el.dataset.wolaiIconPainted===sig)continue;
-        el.dataset.wolaiIconPainted=sig;
-        this.paintDynamicIcon(el,icon,compact);
-      }catch(e){}
+  refreshDynamicIcons() {
+    const documents = new Set([this.app.workspace.containerEl.doc]);
+    this.app.workspace.iterateAllLeaves((leaf) => { documents.add(leaf.view.containerEl.doc); });
+    for (const doc of documents) {
+      for (const el of doc.querySelectorAll<HTMLElement>('[data-wolai-icon]')) {
+        try {
+          const icon: unknown = JSON.parse(el.dataset.wolaiIcon ?? 'null');
+          if (!isPageIcon(icon)) continue;
+          const compact = el.dataset.wolaiIconCompact === '1';
+          const model = icon.style === 'text' ? null : this.iconCalendarModel(icon);
+          const signature = JSON.stringify(model ?? this.iconDynamicText(icon, { compact }));
+          if (el.dataset.wolaiIconPainted === signature) continue;
+          this.paintDynamicIcon(el, icon, compact);
+          el.dataset.wolaiIconPainted = signature;
+        } catch {
+          // A stale or malformed icon dataset is independent of the page content.
+          continue;
+        }
+      }
     }
   }
   redrawOpenViews(){
     for(const leaf of this.app.workspace.getLeavesOfType('markdown')){
-      const view=leaf.view;if(!view)continue;
+      const view=leaf.view;if(!(view instanceof MarkdownView))continue;
       try{
         view.containerEl.querySelectorAll('.wolai-header,.wolai-actions').forEach(el=>el.remove());
         view.containerEl.querySelectorAll('h1').forEach(h=>{delete h.dataset.wolaiHeader;});
@@ -821,26 +908,28 @@ export class RendererPlugin extends Plugin {
       }catch(e){console.error('[wolai-local] 页面重绘失败',e);}
     }
   }
-  openIconPicker(pagePath){
+  openIconPicker(pagePath: string){
     if(!this.data?.nodes[pagePath]){new Notice('页面定义缺失，请重新读取页面导航');return;}
     new IconPickerModal(this.app,this,pagePath).open();
   }
-  openButtonBuilder(pagePath){
+  openButtonBuilder(pagePath: string){
     if(!this.data?.nodes[pagePath]){new Notice('页面定义缺失，请重新读取页面导航');return;}
     new ButtonBuilderModal(this.app,this,pagePath).open();
   }
-  async setIcon(pagePath,icon){
-    const node=this.data?.nodes[pagePath];if(!node)throw new Error('页面定义缺失');
+  async setIcon(pagePath: string,icon: PageIcon | null){
+    const data = this.data;
+    const node = data?.nodes[pagePath];
+    if (!data || !node) throw new Error('页面定义缺失');
     const before=JSON.stringify(node.icon||null);
     if(icon)node.icon=icon;else delete node.icon;
     if(JSON.stringify(node.icon||null)===before)return;
-    await this.saveData(this.data);
+    await this.saveData(data);
     this.refreshViews();this.decorateOpenViews();this.redrawOpenViews();
   }
   listTemplates(){
     return this.app.vault.getFiles().filter(f=>f.extension==='md'&&normalizePath(f.path).startsWith('_wolai/templates/')).map(f=>f.path).sort();
   }
-  async createTemplate(name,content){
+  async createTemplate(name: string,content: string){
     const folder='_wolai/templates';
     if(!this.app.vault.getAbstractFileByPath(folder))await this.app.vault.createFolder(folder);
     let path=normalizePath(folder+'/'+this.safeName(name)+'.md'),i=2;
@@ -848,7 +937,7 @@ export class RendererPlugin extends Plugin {
     await this.app.vault.create(path,content);
     return path;
   }
-  async newButton(pagePath,cfg){
+  async newButton(pagePath: string,cfg: TemplateBlock){
     const node=this.data?.nodes[pagePath];if(!node)throw new Error('页面定义缺失');
     if(!['page','record'].includes(node.type))throw new Error('该类型页面暂不支持插入按钮');
     const file=this.app.vault.getAbstractFileByPath(pagePath);if(!(file instanceof TFile))throw new Error('页面文件缺失');
@@ -857,8 +946,8 @@ export class RendererPlugin extends Plugin {
     await this.app.vault.process(file,body=>body.trimEnd()+'\n\n'+block+'\n');
     this.refreshViews();this.redrawOpenViews();
   }
-  visiblePagePaths(paths,seen=new Set()){
-    const visible=[];
+  visiblePagePaths(paths: string[],seen=new Set<string>()): string[]{
+    const visible: string[] = [];
     for(const path of paths){
       const node=this.data?.nodes[path];if(!node||seen.has(path))continue;seen.add(path);
       if(this.app.vault.getAbstractFileByPath(path) instanceof TFile)visible.push(path);
@@ -866,24 +955,24 @@ export class RendererPlugin extends Plugin {
     }
     return visible;
   }
-  isMissingChildPageLink(sourcePath,href){
+  isMissingChildPageLink(sourcePath: string,href: string | null){
     const parent=this.data?.nodes[sourcePath];
     if(!parent||!['page','record'].includes(parent.type)||typeof href!=='string')return false;
     const target=href.split('#')[0].trim();
     if(!target||/^[a-z][a-z0-9+.-]*:/i.test(target))return false;
     if(this.app.metadataCache.getFirstLinkpathDest(target,sourcePath) instanceof TFile)return false;
     const dir=sourcePath.includes('/')?sourcePath.slice(0,sourcePath.lastIndexOf('/')):'';
-    const pageName=sourcePath.split('/').pop().replace(/\.md$/i,'');
+    const pageName=(sourcePath.split('/').pop() ?? '').replace(/\.md$/i,'');
     const base=parent.type==='record'?[dir,pageName].filter(Boolean).join('/'):dir;
-    const canonical=p=>{
-      const parts=[];
+    const canonical=(p: string)=>{
+      const parts: string[] = [];
       for(const part of p.replace(/\\/g,'/').split('/')){
         if(!part||part==='.')continue;
         if(part==='..'){if(!parts.length)return null;parts.pop();}else parts.push(part);
       }
       const path=parts.join('/');return /\.(md|base)$/i.test(path)?path:path+'.md';
     };
-    const candidates=[canonical(target),canonical([dir,target].filter(Boolean).join('/'))].filter(Boolean);
+    const candidates=[canonical(target),canonical([dir,target].filter(Boolean).join('/'))].filter(isString);
     if(candidates.some(p=>this.app.vault.getAbstractFileByPath(p) instanceof TFile))return false;
     return candidates.some(path=>{
       if(parent.children?.includes(path))return true;
@@ -895,13 +984,13 @@ export class RendererPlugin extends Plugin {
       return parts.length===2&&parts[1]===parts[0]+'.md';
     });
   }
-  updateMissingPageLinks(el,sourcePath){
+  updateMissingPageLinks(el: Element,sourcePath: string){
     el.classList.remove('wolai-missing-page-block');
     el.querySelectorAll('.wolai-missing-page-link,.wolai-missing-page-block').forEach(item=>item.classList.remove('wolai-missing-page-link','wolai-missing-page-block'));
-    for(const link of el.querySelectorAll('a.internal-link')){
+    for(const link of el.querySelectorAll<HTMLAnchorElement>('a.internal-link')){
       const paragraph=link.parentElement;
       if(paragraph?.tagName!=='P')continue;
-      const standalone=[...paragraph.childNodes].every(node=>node===link||(node.nodeType===3&&!node.textContent.trim())||(node.nodeType===1&&node.classList.contains('passage-ai-badge')));
+      const standalone=[...paragraph.childNodes].every(node=>node===link||(node.nodeType===3&&!node.textContent?.trim())||(node.instanceOf(Element)&&node.classList.contains('passage-ai-badge')));
       if(!standalone||!this.isMissingChildPageLink(sourcePath,link.getAttribute('data-href')))continue;
       paragraph.classList.add('wolai-missing-page-link');
       if(paragraph.parentElement?.classList.contains('el-p'))paragraph.parentElement.classList.add('wolai-missing-page-block');
@@ -909,18 +998,40 @@ export class RendererPlugin extends Plugin {
   }
   refreshMissingPageLinks(){
     for(const leaf of this.app.workspace.getLeavesOfType('markdown')){
-      const view=leaf.view;if(!view?.file)continue;
+      const view=leaf.view;if(!(view instanceof MarkdownView) || !view.file)continue;
       const preview=view.containerEl.querySelector('.markdown-preview-view');
       if(preview)this.updateMissingPageLinks(preview,view.file.path);
     }
   }
-  async decorateSection(el,ctx){
-    const n=this.data?.nodes[ctx.sourcePath];if(!n||n.type==='database')return;
-    this.updateMissingPageLinks(el,ctx.sourcePath);
-    if(el.classList.contains('wolai-missing-page-block'))return;
-    await this.decoratePagePositions(el,ctx);
-    for(const a of el.querySelectorAll('a.internal-link')){const target=a.getAttribute('data-href')?.split('#')[0];const file=this.app.metadataCache.getFirstLinkpathDest(target||'',ctx.sourcePath);const child=this.data.nodes[file?.path]||this.data.nodes[target];if(child&&n.children?.includes(child.path)&&!a.dataset.wolaiPage){a.dataset.wolaiPage='1';a.addClass('wolai-child-link');const icon=document.createElement('span');icon.className='wolai-page-icon';this.renderIcon(icon,child.icon,child.type==='database'?'table-2':'file-text',{compact:true});a.prepend(icon);}}
-    const h=el.querySelector('h1');if(!h||h.dataset.wolaiHeader)return;if(n.type==='record'){const db=this.data.nodes[n.databasePath];const primary=db?.schema?.find(c=>c.type==='primary');const file=this.app.vault.getAbstractFileByPath(ctx.sourcePath);const title=file&&primary?this.app.metadataCache.getFileCache(file)?.frontmatter?.[primary.name]:null;if(typeof title==='string'&&title.trim())h.setText(title);}
+  async decorateSection(el: HTMLElement,ctx: MarkdownPostProcessorContext){
+    const data = this.data;
+    const n = data?.nodes[ctx.sourcePath];
+    if (!data || !n || n.type === 'database') return;
+    this.updateMissingPageLinks(el, ctx.sourcePath);
+    if (el.classList.contains('wolai-missing-page-block')) return;
+    await this.decoratePagePositions(el, ctx);
+    for (const anchor of el.querySelectorAll<HTMLAnchorElement>('a.internal-link')) {
+      const target = anchor.getAttribute('data-href')?.split('#')[0];
+      if (!target || anchor.dataset.wolaiPage) continue;
+      const file = this.app.metadataCache.getFirstLinkpathDest(target, ctx.sourcePath);
+      const child = data.nodes[file?.path ?? target] ?? data.nodes[target];
+      if (!child || !n.children.includes(child.path)) continue;
+      anchor.dataset.wolaiPage = '1';
+      anchor.addClass('wolai-child-link');
+      const icon = anchor.createSpan({ cls: 'wolai-page-icon' });
+      this.renderIcon(icon, child.icon, child.type === 'database' ? 'table-2' : 'file-text', { compact: true });
+      anchor.prepend(icon);
+    }
+    const h = el.querySelector('h1');
+    if (!h || h.dataset.wolaiHeader) return;
+    const database = n.databasePath ? data.nodes[n.databasePath] : undefined;
+    if (n.type === 'record') {
+      const primary = database?.schema?.find((column) => column.type === 'primary');
+      const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+      const title: unknown = file instanceof TFile && primary
+        ? this.app.metadataCache.getFileCache(file)?.frontmatter?.[primary.name] : null;
+      if (isString(title) && title.trim()) h.setText(title);
+    }
     const info=ctx.getSectionInfo(el);
     if(n.type==='page'&&(n.settings?.wolai_export_layout ? info?.lineStart!==0 : info&&info.lineStart>30))return;
     h.dataset.wolaiHeader='1';
@@ -930,6 +1041,7 @@ export class RendererPlugin extends Plugin {
       const url=file instanceof TFile?this.app.vault.getResourcePath(file):(/^https?:\/\//.test(n.cover)?n.cover:null);
       const slot=host.createDiv();
       const renderCover=()=>{
+        if (!url) return;
         slot.empty();
         const cover=slot.createEl('img',{cls:'wolai-cover',attr:{alt:''}});
         if(n.settings?.cover_position)cover.style.objectPosition='center '+n.settings.cover_position;
@@ -945,43 +1057,88 @@ export class RendererPlugin extends Plugin {
     const newChild=actions.createEl('button',{text:'+ 子页面'});newChild.onclick=()=>this.newChild(ctx.sourcePath);
     if(n.type==='page'||n.type==='record'){const newBtn=actions.createEl('button',{text:'+ 按钮'});newBtn.onclick=()=>this.openButtonBuilder(ctx.sourcePath);}
     if(n.type==='record'){
-      actions.remove();const db=this.data.nodes[n.databasePath];
+      actions.remove();const db = database;
       for(const issue of n.dataErrors||[])el.createDiv({text:issue.message,cls:'wolai-error'});
-      if(db?.formulaError){el.createDiv({text:db.formulaError,cls:'wolai-error'});}else if(db?.computedView){const computed=el.createDiv({cls:'wolai-record-computed'});h.after(computed);const child=new MarkdownRenderChild(computed);ctx.addChild(child);if(db.snapshotColumns?.length)computed.createDiv({text:'以下字段保留迁移时的 wolai 计算结果，修改输入不会自动重算。',cls:'wolai-snapshot-warning'});try{await MarkdownRenderer.render(this.app,'![[ '+db.computedView+' ]]'.replace('![[ ','![[').replace(' ]]',']]'),computed,ctx.sourcePath,child);}catch(e){this.errorBox(computed,'计算字段加载失败：'+e.message,()=>this.open(ctx.sourcePath));}}
-      if(n.databasePath){const back=el.createEl('a',{text:'← 返回表格',cls:'wolai-record-back'});back.onclick=()=>this.open(n.databasePath);h.before(back);}}
+      if(db?.formulaError){el.createDiv({text:db.formulaError,cls:'wolai-error'});}else if(db?.computedView){const computed=el.createDiv({cls:'wolai-record-computed'});h.after(computed);const child=new MarkdownRenderChild(computed);ctx.addChild(child);if(db.snapshotColumns?.length)computed.createDiv({text:'以下字段保留迁移时的 wolai 计算结果，修改输入不会自动重算。',cls:'wolai-snapshot-warning'});try{await MarkdownRenderer.render(this.app,'![[ '+db.computedView+' ]]'.replace('![[ ','![[').replace(' ]]',']]'),computed,ctx.sourcePath,child);}catch(e){this.errorBox(computed,'计算字段加载失败：'+errorMessage(e),()=>this.open(ctx.sourcePath));}}
+      const databasePath = n.databasePath;
+      if(databasePath){const back=el.createEl('a',{text:'← 返回表格',cls:'wolai-record-back'});back.onclick=()=>this.open(databasePath);h.before(back);}}
   }
-  decorateOpenViews(){for(const leaf of this.app.workspace.getLeavesOfType('markdown')){
-    const view=leaf.view,n=this.data?.nodes[view.file?.path];view.containerEl.dataset.wolaiDatabase=n?.databasePath?this.data.nodes[n.databasePath]?.sourceId||'':'';view.containerEl.toggleClass('wolai-view',!!n);view.containerEl.toggleClass('wolai-record',n?.type==='record');view.containerEl.toggleClass('wolai-full-width',!!n?.settings?.is_full_width);view.containerEl.toggleClass('wolai-small-text',!!n?.settings?.is_small_text);view.containerEl.toggleClass('wolai-export-layout',!!n?.settings?.wolai_export_layout);
-  }}
-  async syncComputedView(node){
-    try{const source=this.app.vault.getAbstractFileByPath(node.path),target=this.app.vault.getAbstractFileByPath(node.computedView);if(!(source instanceof TFile)||!(target instanceof TFile))throw new Error('原表或计算视图文件缺失');const cfg=parseYaml(await this.app.vault.read(source));if(!cfg?.formulas||typeof cfg.formulas!=='object'||Object.values(cfg.formulas).some(v=>typeof v!=='string'))throw new Error('原表公式定义无效');const order=cfg.views?.[0]?.order;if(!Array.isArray(order)||order.some(k=>typeof k!=='string'))throw new Error('原表列顺序缺失或无效');const visible=order.filter(k=>k.startsWith('formula.'));if(visible.some(k=>!Object.prototype.hasOwnProperty.call(cfg.formulas,k.slice(8))))throw new Error('原表包含未定义的计算字段');const properties={};for(const [name,value] of Object.entries(cfg.properties||{}))if(name.startsWith('formula.'))properties[name]=value;const next=stringifyYaml({filters:{and:['file.path == this.file.path']},formulas:cfg.formulas,properties,views:[{type:'table',name:'计算字段',order:visible}]});if(next!==await this.app.vault.read(target))await this.app.vault.modify(target,next);delete node.formulaError;}
-    catch(e){node.formulaError='计算字段更新失败：'+e.message+'。请修复原表后重试。';await this.saveData(this.data);throw e;}
+  decorateOpenViews() {
+    const nodes = this.data?.nodes;
+    for (const { view } of this.app.workspace.getLeavesOfType('markdown')) {
+      if (!(view instanceof MarkdownView)) continue;
+      const node = view.file ? nodes?.[view.file.path] : undefined;
+      const database = node?.databasePath ? nodes?.[node.databasePath] : undefined;
+      view.containerEl.dataset.wolaiDatabase = database?.sourceId ?? '';
+      view.containerEl.toggleClass('wolai-view', !!node);
+      view.containerEl.toggleClass('wolai-record', node?.type === 'record');
+      view.containerEl.toggleClass('wolai-full-width', !!node?.settings?.is_full_width);
+      view.containerEl.toggleClass('wolai-small-text', !!node?.settings?.is_small_text);
+      view.containerEl.toggleClass('wolai-export-layout', !!node?.settings?.wolai_export_layout);
+    }
   }
-  safeName(title){const s=title.replace(/[\\/:*?"<>|#^\[\]\x00-\x1f]/g,' ').replace(/\s+/g,' ').trim();if(!s)throw new Error('页面名称没有可用的文件名字符');return s;}
-  async ensureFolder(path){if(!path)return;const pieces=path.split('/');let current='';for(const piece of pieces){current=current?current+'/'+piece:piece;if(!this.app.vault.getAbstractFileByPath(current))await this.app.vault.createFolder(current);}}
-  newChild(parentPath,position=null){const modal=new NameModal(this.app,'新建子页面',title=>this.createChild(parentPath,title,position));modal.open();return modal;}
-  async createChild(parentPath,title,position=null){
-    const parent=this.data?.nodes[parentPath];if(!parent)throw new Error('父页面定义缺失');if(!['page','record'].includes(parent.type))throw new Error('请使用表格的新增记录操作');
+
+  async syncComputedView(node: IndexNode) {
+    try {
+      const source = this.app.vault.getAbstractFileByPath(node.path);
+      const target = node.computedView ? this.app.vault.getAbstractFileByPath(node.computedView) : null;
+      if (!(source instanceof TFile) || !(target instanceof TFile)) throw new Error('原表或计算视图文件缺失');
+      const config: unknown = parseYaml(await this.app.vault.read(source));
+      if (!isRecord(config) || !isRecord(config.formulas) || !Object.values(config.formulas).every(isString)) {
+        throw new Error('原表公式定义无效');
+      }
+      const view = isArray(config.views) ? config.views[0] : null;
+      const order = isRecord(view) ? view.order : null;
+      if (!isArray(order) || !order.every(isString)) throw new Error('原表列顺序缺失或无效');
+      const visible = order.filter((key) => key.startsWith('formula.'));
+      const formulas = config.formulas;
+      if (visible.some((key) => !Object.hasOwn(formulas, key.slice(8)))) throw new Error('原表包含未定义的计算字段');
+      const properties = isRecord(config.properties)
+        ? Object.fromEntries(Object.entries(config.properties).filter(([key]) => key.startsWith('formula.'))) : {};
+      const next = stringifyYaml({
+        filters: { and: ['file.path == this.file.path'] }, formulas, properties,
+        views: [{ type: 'table', name: '计算字段', order: visible }],
+      });
+      if (next !== await this.app.vault.read(target)) await this.app.vault.modify(target, next);
+      delete node.formulaError;
+    } catch (error) {
+      node.formulaError = '计算字段更新失败：' + errorMessage(error) + '。请修复原表后重试。';
+      if (this.data?.nodes[node.path] === node) await this.saveData(this.data);
+      throw error;
+    }
+  }
+  safeName(title: string): string {
+    const name = cleanFileName(title);
+    if (!name) throw new Error('页面名称没有可用的文件名字符');
+    return name;
+  }
+  async ensureFolder(path: string){if(!path)return;const pieces=path.split('/');let current='';for(const piece of pieces){current=current?current+'/'+piece:piece;if(!this.app.vault.getAbstractFileByPath(current))await this.app.vault.createFolder(current);}}
+  newChild(parentPath: string,position: PagePosition | null = null){const modal=new NameModal(this.app,'新建子页面',title=>this.createChild(parentPath,title,position));modal.open();return modal;}
+  async createChild(parentPath: string,title: string,position: PagePosition | null = null){
+    const data = this.data;
+    const parent = data?.nodes[parentPath];
+    if (!data || !parent) throw new Error('父页面定义缺失');if(!['page','record'].includes(parent.type))throw new Error('请使用表格的新增记录操作');
     const file=this.app.vault.getAbstractFileByPath(parentPath);if(!(file instanceof TFile))throw new Error('父页面文件缺失');
     if(position)this.checkPagePosition(await this.app.vault.read(file),position);
-    const baseFolder=parent.type==='record'?normalizePath(file.parent.path+'/'+file.basename):file.parent.path;
+    const directory = file.parent?.path ?? '';
+    const baseFolder = parent.type === 'record' ? normalizePath(directory + '/' + file.basename) : directory;
     let folder=normalizePath(baseFolder+'/'+this.safeName(title)),i=2;while(this.app.vault.getAbstractFileByPath(folder))folder=normalizePath(baseFolder+'/'+this.safeName(title)+' '+i++);
     const path=folder+'/'+folder.split('/').pop()+'.md';await this.ensureFolder(folder);const n=await this.app.vault.create(path,'# '+title+'\n\n');
-    let nextBody;
+    let nextBody: string | undefined;
     try{await this.app.vault.process(file,text=>{
       const link='[['+path.slice(0,-3)+'|'+title.replace(/[\]|]/g,' ')+']]';
       if(position)this.checkPagePosition(text,position);
       nextBody=position?this.insertPageBlock(text,link,position.at):this.insertChildLink(text,link,parentPath);return nextBody;
     });}catch(e){
       // Only undo the new, unindexed file if the parent changed while the modal was open.
-      await this.app.vault.delete(n,true);const createdFolder=this.app.vault.getAbstractFileByPath(folder);
-      if(createdFolder?.children?.length===0)await this.app.vault.delete(createdFolder,true);throw e;
+      await this.app.fileManager.trashFile(n);const createdFolder=this.app.vault.getAbstractFileByPath(folder);
+      if(createdFolder instanceof TFolder && createdFolder.children.length === 0)await this.app.fileManager.trashFile(createdFolder);throw e;
     }
-    this.data.nodes[path]={path,title,type:'page',children:[]};parent.children??=[];parent.children.unshift(path);
-    if(position)this.syncBodyChildOrder(parentPath,nextBody);
-    await this.saveData(this.data);await this.open(n.path);this.refreshViews();return n;
+    data.nodes[path]={path,title,type:'page',children:[]};parent.children.unshift(path);
+    if(position && nextBody !== undefined)this.syncBodyChildOrder(parentPath,nextBody);
+    await this.saveData(data);await this.open(n.path);this.refreshViews();return n;
   }
-  pageBlockRange(info){
+  pageBlockRange(info: MarkdownSectionInformation | null): PageRange | null{
     if(!info||typeof info.text!=='string'||!Number.isInteger(info.lineStart)||!Number.isInteger(info.lineEnd)||info.lineStart<0||info.lineEnd<info.lineStart)return null;
     const lines=info.text.split('\n');if(info.lineEnd>=lines.length)return null;
     let start=0;for(let i=0;i<info.lineStart;i++)start+=lines[i].length+1;
@@ -992,17 +1149,17 @@ export class RendererPlugin extends Plugin {
     if(id)end+=id[0].length;
     return {expected:info.text,start,end};
   }
-  checkPagePosition(body,position){
+  checkPagePosition(body: string,position: PagePosition){
     if(body!==position.expected)throw new Error('页面内容已变化，请回到父页面重新选择位置');
     if(!Number.isInteger(position.at)||position.at<0||position.at>body.length)throw new Error('插入位置无效');
   }
-  insertPageBlock(body,block,at){
+  insertPageBlock(body: string,block: string,at: number){
     const newline=body.includes('\r\n')?'\r\n':'\n',left=body.slice(0,at),right=body.slice(at);
     const before=(left.match(/(?:\r?\n)*$/)?.[0].match(/\n/g)||[]).length;
     const after=(right.match(/^(?:\r?\n)*/)?.[0].match(/\n/g)||[]).length;
     return left+(left?newline.repeat(Math.max(0,2-before)):'')+block+(right?newline.repeat(Math.max(0,2-after)):newline)+right;
   }
-  pageLinkPath(body,range,parentPath){
+  pageLinkPath(body: string,range: PageRange,parentPath: string){
     const source=body.slice(range.start,range.end).replace(/\r/g,'');
     const m=/^\[\[([^\]|#]+)(?:\|[^\]\n]*)?\]\](?:[\t ]+\^[A-Za-z0-9-]+)?(?:\n[\t \n]*\^[A-Za-z0-9-]+[\t ]*)?$/.exec(source);
     if(!m)return null;
@@ -1012,21 +1169,23 @@ export class RendererPlugin extends Plugin {
   }
   async refreshBodyChildOrders(){
     const data=this.data;if(!data)return;
-    const cache=this.bodyOrderCache??=new Map();
+    const cache = this.bodyOrderCache;
     const parents=Object.values(data.nodes).filter(n=>['page','record'].includes(n.type)&&n.children?.length);
-    const signature=file=>file.stat.mtime+':'+file.stat.size;
+    const signature=(file: TFile)=>file.stat.mtime+':'+file.stat.size;
     // Cache reads, not the derived order: newly synced children and a reloaded
     // shared index must be reconciled against the same authoritative body again.
-    const refresh=async parent=>{
+    const refresh=async (parent: IndexNode)=>{
       const file=this.app.vault.getAbstractFileByPath(parent.path);
       if(!(file instanceof TFile))return;
       const stamp=signature(file);let entry=cache.get(file.path);
       if(!entry||entry.file!==file||entry.stamp!==stamp){
-        entry={file,stamp};cache.set(file.path,entry);
-        entry.read=this.app.vault.cachedRead(file).catch(error=>{
-          if(cache.get(file.path)===entry)cache.delete(file.path);
-          console.warn('[wolai-local] 页面顺序读取暂不可用',file.path,error);return null;
+        const read = this.app.vault.cachedRead(file).catch((error: unknown): null => {
+          if (cache.get(file.path) === entry) cache.delete(file.path);
+          console.warn('[wolai-local] 页面顺序读取暂不可用', file.path, error);
+          return null;
         });
+        entry = { file, stamp, read };
+        cache.set(file.path, entry);
       }
       const body=await entry.read;
       if(this.data!==data||cache.get(file.path)!==entry||signature(file)!==stamp||this.app.vault.getAbstractFileByPath(file.path)!==file||typeof body!=='string')return;
@@ -1038,12 +1197,12 @@ export class RendererPlugin extends Plugin {
     }
     // This is a local navigation repair; never save a partially synced index.
   }
-  childLinkTarget(target,parentPath,children){
+  childLinkTarget(target: string,parentPath: string,children: Set<string>){
     const file=this.app.metadataCache.getFirstLinkpathDest(target,parentPath);
     if(file&&children.has(file.path))return file.path;
     const dir=parentPath.includes('/')?parentPath.slice(0,parentPath.lastIndexOf('/')):'';
     for(const candidate of [target,[dir,target].filter(Boolean).join('/')]){
-      const parts=[];let invalid=false;
+      const parts: string[] = [];let invalid=false;
       for(const part of candidate.replace(/\\/g,'/').split('/')){
         if(!part||part==='.')continue;
         if(part==='..'){if(!parts.length){invalid=true;break;}parts.pop();}else parts.push(part);
@@ -1054,9 +1213,9 @@ export class RendererPlugin extends Plugin {
     }
     return null;
   }
-  syncBodyChildOrder(parentPath,body){
+  syncBodyChildOrder(parentPath: string,body: string){
     const parent=this.data?.nodes[parentPath];if(!parent||!['page','record'].includes(parent.type)||!parent.children?.length)return false;
-    const children=new Set(parent.children),ordered=[];let fence=null,frontmatter=false;
+    const children=new Set(parent.children),ordered: string[]=[];let fence: string | null=null,frontmatter=false;
     for(const [index,line] of body.split(/\r?\n/).entries()){
       if(index===0&&line==='---'){frontmatter=true;continue;}
       if(frontmatter){if(line==='---'||line==='...')frontmatter=false;continue;}
@@ -1066,16 +1225,16 @@ export class RendererPlugin extends Plugin {
       const link=/^ {0,3}(?:[-*+] )?\[\[([^\]|#]+)(?:\|[^\]]*)?\]\](?:[\t ]+\^[A-Za-z0-9-]+)?[\t ]*$/.exec(line);
       if(!link)continue;
       const path=this.childLinkTarget(link[1].trim(),parentPath,children);
-      if(children.has(path)&&!ordered.includes(path))ordered.push(path);
+      if(path && !ordered.includes(path))ordered.push(path);
     }
     const next=[...ordered,...parent.children.filter(path=>!ordered.includes(path))];
     if(next.every((path,index)=>path===parent.children[index]))return false;
     parent.children.splice(0,parent.children.length,...next);return true;
   }
-  async movePageLink(parentPath,dragged,destination){
+  async movePageLink(parentPath: string,dragged: PageDrag,destination: PagePosition){
     const parent=this.data?.nodes[parentPath],file=this.app.vault.getAbstractFileByPath(parentPath);
     if(dragged.parentPath!==parentPath||!parent?.children?.includes(dragged.childPath)||!(file instanceof TFile))throw new Error('父页面或子页面已变化');
-    let nextBody;
+    let nextBody: string | undefined;
     await this.app.vault.process(file,body=>{
       this.checkPagePosition(body,destination);
       if(dragged.expected!==body||this.pageLinkPath(body,dragged,parentPath)!==dragged.childPath)throw new Error('子页面入口已变化，请重新拖动');
@@ -1085,14 +1244,19 @@ export class RendererPlugin extends Plugin {
       const at=destination.at>end?destination.at-(end-dragged.start):destination.at;
       nextBody=this.insertPageBlock(rest,block,at);return nextBody;
     });
-    if(this.syncBodyChildOrder(parentPath,nextBody))await this.saveData(this.data);
+    if(nextBody !== undefined && this.syncBodyChildOrder(parentPath,nextBody) && this.data)await this.saveData(this.data);
     this.refreshViews();
   }
-  clearPageDrag(){
-    this.pageDrag=null;this.app.workspace.containerEl.removeClass('wolai-page-moving');this.app.workspace.containerEl.querySelectorAll('.wolai-drop-before,.wolai-drop-after,.wolai-page-dragging').forEach(el=>el.removeClass('wolai-drop-before','wolai-drop-after','wolai-page-dragging'));
+  clearPageDrag() {
+    const preview = this.pageDrag?.preview;
+    this.pageDrag = null;
+    if (!preview) return;
+    preview.removeClass('wolai-page-moving');
+    preview.querySelectorAll('.wolai-drop-before,.wolai-drop-after,.wolai-page-dragging')
+      .forEach((el) => el.removeClass('wolai-drop-before', 'wolai-drop-after', 'wolai-page-dragging'));
   }
-  async decoratePagePositions(el,ctx){
-    if(el.dataset.wolaiPositions||!['page','record'].includes(this.data?.nodes[ctx.sourcePath]?.type))return;
+  async decoratePagePositions(el: HTMLElement,ctx: MarkdownPostProcessorContext){
+    if(el.dataset.wolaiPositions||!['page','record'].includes(this.data?.nodes[ctx.sourcePath]?.type ?? ''))return;
     if(![...el.classList].some(name=>name.startsWith('el-'))||el.closest('.markdown-embed'))return;
     const file=this.app.vault.getAbstractFileByPath(ctx.sourcePath);if(!(file instanceof TFile))return;
     const body=await this.app.vault.cachedRead(file);
@@ -1107,46 +1271,64 @@ export class RendererPlugin extends Plugin {
       const range=this.pageBlockRange(ctx.getSectionInfo(el));if(!range)throw new Error('无法读取正文位置');return range;
     };
     const insert=el.createEl('button',{cls:'wolai-insert-page',attr:{type:'button',title:'在此处新建子页面','aria-label':'在此处新建子页面'}});setIcon(insert,'plus');
-    insert.onclick=event=>{event.preventDefault();event.stopPropagation();try{const range=location();this.newChild(ctx.sourcePath,{expected:range.expected,at:range.end});}catch(e){new Notice(e.message);}};
+    insert.onclick=event=>{event.preventDefault();event.stopPropagation();try{const range=location();this.newChild(ctx.sourcePath,{expected:range.expected,at:range.end});}catch(e){new Notice(errorMessage(e));}};
     const childPath=this.pageLinkPath(initial.expected,initial,ctx.sourcePath);
     if(childPath){
       const handle=el.createEl('button',{cls:'wolai-page-drag-handle',attr:{type:'button',draggable:'true',title:'拖动调整子页面位置','aria-label':'拖动调整子页面位置'}});setIcon(handle,'grip-vertical');
       handle.onclick=event=>{event.preventDefault();event.stopPropagation();};
-      handle.ondragstart=event=>{try{const range=location();if(this.pageLinkPath(range.expected,range,ctx.sourcePath)!==childPath)throw new Error('子页面入口已变化，请重新拖动');this.pageDrag={...range,childPath,parentPath:ctx.sourcePath};event.dataTransfer.setData('application/x-wolai-page-link',childPath);event.dataTransfer.effectAllowed='move';this.app.workspace.containerEl.addClass('wolai-page-moving');el.addClass('wolai-page-dragging');event.stopPropagation();}catch(e){event.preventDefault();new Notice(e.message);}};
+      handle.ondragstart = (event) => {
+        try {
+          const range = location();
+          const preview = el.closest<HTMLElement>('.markdown-preview-view');
+          if (!event.dataTransfer || !preview) return;
+          if (this.pageLinkPath(range.expected, range, ctx.sourcePath) !== childPath) throw new Error('子页面入口已变化，请重新拖动');
+          this.clearPageDrag();
+          this.pageDrag = { ...range, childPath, parentPath: ctx.sourcePath, preview };
+          event.dataTransfer.setData('application/x-wolai-page-link', childPath);
+          event.dataTransfer.effectAllowed = 'move';
+          preview.addClass('wolai-page-moving');
+          el.addClass('wolai-page-dragging');
+          event.stopPropagation();
+        } catch (error) {
+          event.preventDefault();
+          new Notice(errorMessage(error));
+        }
+      };
       handle.ondragend=()=>this.clearPageDrag();
     }
-    const dropSide=event=>el.querySelector('h1[data-wolai-header]')?'after':event.clientY<el.getBoundingClientRect().top+el.getBoundingClientRect().height/2?'before':'after';
+    const dropSide=(event: DragEvent)=>el.querySelector('h1[data-wolai-header]')?'after':event.clientY<el.getBoundingClientRect().top+el.getBoundingClientRect().height/2?'before':'after';
     controls.registerDomEvent(el,'dragover',event=>{
-      if(this.pageDrag?.parentPath!==ctx.sourcePath)return;
+      if(this.pageDrag?.parentPath!==ctx.sourcePath || !event.dataTransfer)return;
       event.preventDefault();event.stopPropagation();event.dataTransfer.dropEffect='move';
-      this.app.workspace.containerEl.querySelectorAll('.wolai-drop-before,.wolai-drop-after').forEach(other=>other.removeClass('wolai-drop-before','wolai-drop-after'));
+      el.doc.querySelectorAll('.wolai-drop-before,.wolai-drop-after').forEach(other=>other.removeClass('wolai-drop-before','wolai-drop-after'));
       el.addClass('wolai-drop-'+dropSide(event));
     });
-    controls.registerDomEvent(el,'dragleave',event=>{if(!el.contains(event.relatedTarget))el.removeClass('wolai-drop-before','wolai-drop-after');});
+    controls.registerDomEvent(el,'dragleave',event=>{if(!isDomNode(event.relatedTarget) || !el.contains(event.relatedTarget))el.removeClass('wolai-drop-before','wolai-drop-after');});
     controls.registerDomEvent(el,'drop',event=>{
       if(this.pageDrag?.parentPath!==ctx.sourcePath)return;
       event.preventDefault();event.stopPropagation();const dragged=this.pageDrag;
-      try{const range=location(),at=dropSide(event)==='before'?range.start:range.end;this.movePageLink(ctx.sourcePath,dragged,{expected:range.expected,at}).catch(e=>new Notice('移动失败：'+e.message));}
-      catch(e){new Notice('移动失败：'+e.message);}finally{this.clearPageDrag();}
+      try{const range=location(),at=dropSide(event)==='before'?range.start:range.end;this.movePageLink(ctx.sourcePath,dragged,{expected:range.expected,at}).catch(e=>new Notice('移动失败：'+errorMessage(e)));}
+      catch(e){new Notice('移动失败：'+errorMessage(e));}finally{this.clearPageDrag();}
     });
   }
-  newRecord(basePath){const node=this.data?.nodes[basePath];if(!node?.schema||!node.recordsFolder){new Notice('原始表格字段尚未核验，暂不能创建记录');return;}
+  newRecord(basePath: string){const node=this.data?.nodes[basePath];if(!node?.schema||!node.recordsFolder){new Notice('原始表格字段尚未核验，暂不能创建记录');return;}
     new NameModal(this.app,'新增 '+node.title+' 记录',async title=>{
       if(this.error||!this.data||this.data.nodes[basePath]!==node)throw new Error('页面目录已变化或读取失败，请关闭后重新打开新增记录');
-      const primary=node.schema.find(c=>c.type==='primary');if(!primary)throw new Error('表格缺少主字段定义');
-      const props={_wolai_database:node.sourceId,_wolai_order:Date.now()};for(const c of node.schema){if(['created_time','last_edited_time'].includes(c.type)){props[c.name]=new Date().toISOString();continue;}if(['formula','rollup','created_by','last_edited_by'].includes(c.type))continue;props[c.name]=c.name===primary.name?title:null;}
+      const primary=node.schema?.find(c=>c.type==='primary');if(!primary)throw new Error('表格缺少主字段定义');
+      const props: Record<string, RecordValue | undefined> = {_wolai_database:node.sourceId,_wolai_order:Date.now()};for(const c of node.schema ?? []){if(['created_time','last_edited_time'].includes(c.type)){props[c.name]=new Date().toISOString();continue;}if(['formula','rollup','created_by','last_edited_by'].includes(c.type))continue;props[c.name]=c.name===primary.name?title:null;}
       let path=normalizePath(node.recordsFolder+'/'+this.safeName(title)+'.md'),i=2;while(this.app.vault.getAbstractFileByPath(path))path=normalizePath(node.recordsFolder+'/'+this.safeName(title)+' '+(i++)+'.md');
+      if (!node.recordsFolder) throw new Error('表格记录目录缺失');
       await this.ensureFolder(node.recordsFolder);const f=await this.app.vault.create(path,'---\n'+stringifyYaml(props)+'---\n\n# '+title+'\n\n');
       this.data.nodes[path]={path,title,type:'record',databasePath:basePath,children:[]};node.children??=[];node.children.push(path);await this.saveData(this.data);await this.open(f.path);this.refreshViews();
     }).open();
   }
-  async createFormRecord(node,values){
+  async createFormRecord(node: IndexNode,values: ReadonlyMap<string, RecordValue>){
     if(this.error||!this.data||this.data.nodes[node.path]!==node)throw new Error('页面目录已变化或读取失败，请重新读取页面导航后重试');
-    if(!node.schema||!node.recordsFolder)throw new Error('表格字段定义缺失');const props={_wolai_database:node.sourceId,_wolai_order:Date.now()};for(const col of node.schema){if(['created_time','last_edited_time'].includes(col.type)){props[col.name]=new Date().toISOString();continue;}if(['formula','rollup','created_by','last_edited_by'].includes(col.type))continue;props[col.name]=Object.prototype.hasOwnProperty.call(values,col.name)?values[col.name]:null;}
-    const primary=node.schema.find(c=>c.type==='primary');if(!primary)throw new Error('主字段定义缺失');const title=props[primary.name];const filename=title?this.safeName(title):'记录 '+window.moment().format('YYYYMMDD-HHmmss');let path=normalizePath(node.recordsFolder+'/'+filename+'.md'),i=2;while(this.app.vault.getAbstractFileByPath(path))path=normalizePath(node.recordsFolder+'/'+filename+' '+(i++)+'.md');
+    if(!node.schema||!node.recordsFolder)throw new Error('表格字段定义缺失');const props: Record<string, RecordValue | undefined> = {_wolai_database:node.sourceId,_wolai_order:Date.now()};for(const col of node.schema){if(['created_time','last_edited_time'].includes(col.type)){props[col.name]=new Date().toISOString();continue;}if(['formula','rollup','created_by','last_edited_by'].includes(col.type))continue;props[col.name]=values.get(col.name) ?? null;}
+    const primary=node.schema?.find(c=>c.type==='primary');if(!primary)throw new Error('主字段定义缺失');const primaryValue = props[primary.name];const title = primaryValue == null ? '' : String(primaryValue);const filename=title?this.safeName(title):'记录 '+moment().format('YYYYMMDD-HHmmss');let path=normalizePath(node.recordsFolder+'/'+filename+'.md'),i=2;while(this.app.vault.getAbstractFileByPath(path))path=normalizePath(node.recordsFolder+'/'+filename+' '+(i++)+'.md');
     await this.ensureFolder(node.recordsFolder);const file=await this.app.vault.create(path,'---\n'+stringifyYaml(props)+'---\n\n# '+(title||'新页面')+'\n\n');this.data.nodes[path]={path,title:title||'新页面',type:'record',databasePath:node.path,children:[]};node.children??=[];node.children.push(path);await this.saveData(this.data);this.refreshViews();return file;
   }
-  childLinkInsertIndex(body,parentPath){
+  childLinkInsertIndex(body: string,parentPath: string){
     const parent=this.data?.nodes[parentPath];
     if(!parent)return -1;
     const kids=new Set(parent.children||[]);
@@ -1163,7 +1345,7 @@ export class RendererPlugin extends Plugin {
     return -1;
   }
   // 新建子页面时把链接插到子页面列表**最前面**（wolai 行为：由近到远）
-  insertChildLink(body,link,parentPath){
+  insertChildLink(body: string,link: string,parentPath: string){
     const at=this.childLinkInsertIndex(body,parentPath);
     if(at<0)return body.trimEnd()+'\n\n'+link+'\n';
     let start=at;
@@ -1178,7 +1360,7 @@ export class RendererPlugin extends Plugin {
     return body.slice(0,start)+link+'\n\n'+body.slice(start);
   }
   // 删掉子页面后：移除父页面正文里的链接 + 清理空的页面目录（wolai 行为）
-  async cleanupDeletedPage(file,parents){
+  async cleanupDeletedPage(file: TFile,parents: string[]){
     for(const parentPath of parents||[]){
       try{await this.removeChildLink(parentPath,file.path);}
       catch(e){console.warn('[wolai-local] 移除父页面链接失败',parentPath,e);}
@@ -1192,15 +1374,15 @@ export class RendererPlugin extends Plugin {
       if(folderPath.includes('/')===false)return;
       for(let attempt=0;attempt<3;attempt++){
         const folder=this.app.vault.getAbstractFileByPath(folderPath);
-        if(!folder||!Array.isArray(folder.children))return;
-        if(folder.children.length){if(attempt<2){await new Promise(r=>setTimeout(r,400));continue;}return;}
+        if(!(folder instanceof TFolder))return;
+        if(folder.children.length){if(attempt<2){await new Promise<void>(resolve => window.setTimeout(resolve, 400));continue;}return;}
         if(folder.name!==file.basename)return;   // 只清理 wolai 结构：<目录>/<同名>.md
-        await this.app.vault.delete(folder,true);
+        await this.app.fileManager.trashFile(folder);
         return;
       }
     }catch(e){console.warn('[wolai-local] 清理空页面目录失败',e);}
   }
-  async removeChildLink(parentPath,childPath){
+  async removeChildLink(parentPath: string,childPath: string){
     const f=this.app.vault.getAbstractFileByPath(parentPath);
     if(!(f instanceof TFile))return 0;
     let removed=0;
@@ -1219,27 +1401,27 @@ export class RendererPlugin extends Plugin {
     });
     return removed;
   }
-  async applyTemplate(t,ctx){
+  async applyTemplate(t: TemplateBlock,ctx: MarkdownPostProcessorContext){
     if(this.error||!this.data||!this.data.nodes[ctx.sourcePath])throw new Error('页面目录读取失败，请重新读取页面导航后重试');
     const file=this.app.vault.getAbstractFileByPath(ctx.sourcePath);if(!(file instanceof TFile))throw new Error('父页面文件缺失');
-    const now=window.moment();const replacements={'%YEAR%':now.format('YYYY'),'%MONTH%':now.format('M'),'%MONTH2%':now.format('MM'),'%DAY%':now.format('D'),'%DAY2%':now.format('DD'),'%WEEK%':now.format('w'),'%WEEK2%':now.format('ww'),'%DAYOFWEEK%':['日','一','二','三','四','五','六'][now.day()],'%DATE%':now.format('YYYY/MM/DD'),'%TIME%':now.format('HH:mm')};
-    let text;
+    const now=moment();const replacements={'%YEAR%':now.format('YYYY'),'%MONTH%':now.format('M'),'%MONTH2%':now.format('MM'),'%DAY%':now.format('D'),'%DAY2%':now.format('DD'),'%WEEK%':now.format('w'),'%WEEK2%':now.format('ww'),'%DAYOFWEEK%':['日','一','二','三','四','五','六'][now.day()],'%DATE%':now.format('YYYY/MM/DD'),'%TIME%':now.format('HH:mm')};
+    let text: string;
     if(typeof t.body==='string'){text=t.body;}
-    else{const template=this.app.vault.getAbstractFileByPath(t.template);if(!(template instanceof TFile))throw new Error('模板文件缺失');text=await this.app.vault.read(template);}
+    else{const template=this.app.vault.getAbstractFileByPath(t.template ?? '');if(!(template instanceof TFile))throw new Error('模板文件缺失');text=await this.app.vault.read(template);}
     for(const [a,b] of Object.entries(replacements))text=text.replace(new RegExp(a,'gi'),b);
     if(/%[A-Z0-9]+%/i.test(text))throw new Error('模板含未支持的日期变量');
     if(t.mode==='inline'){
-      if(typeof t.containerBlockId!=='string'||!t.containerBlockId||!['bottom','top'].includes(t.addPosition))throw new Error('内嵌模板位置定义无效');
+      if(!t.containerBlockId||(t.addPosition!=='bottom'&&t.addPosition!=='top'))throw new Error('内嵌模板位置定义无效');
       if(!text.trim())throw new Error('模板内容为空');
       await this.app.vault.process(file,body=>{
         const pattern=/```wolai-toggle\n([^\n]+)\n```\n\n\^w-([A-Za-z0-9]+)(?=\n|$)/g;
         const blocks=[...body.matchAll(pattern)].filter(m=>m[2]===t.containerBlockId);
         if(blocks.length!==1)throw new Error(blocks.length===0?'未找到按钮所在的折叠块（inline 模式按钮必须放在折叠块内部）':'模板所在折叠块已变化，请重新打开页面');
-        const block=blocks[0],item=JSON.parse(block[1]);if(typeof item.markdown!=='string')throw new Error('折叠块内容无效');
+        const block=blocks[0],item=readToggle(block[1]);
         const buttons=[...item.markdown.matchAll(/```wolai-template\n([^\n]+)\n```/g)].filter(m=>{
-          const config=JSON.parse(m[1]);return config.sourceId===t.sourceId;
+          const config=readTemplate(m[1]);return config.sourceId===t.sourceId;
         });
-        if(buttons.length!==1||JSON.stringify(JSON.parse(buttons[0][1]))!==JSON.stringify(t))throw new Error('模板按钮配置已变化，请重新打开页面');
+        if(buttons.length!==1||JSON.stringify(readTemplate(buttons[0][1]))!==JSON.stringify(t))throw new Error('模板按钮配置已变化，请重新打开页面');
         const button=buttons[0],offset=button.index+(t.addPosition==='bottom'?button[0].length:0);
         item.markdown=item.markdown.slice(0,offset).trimEnd()+'\n\n'+text.trim()+'\n\n'+item.markdown.slice(offset).trimStart();
         const replacement='```wolai-toggle\n'+JSON.stringify(item)+'\n```\n\n^w-'+t.containerBlockId;
@@ -1249,9 +1431,10 @@ export class RendererPlugin extends Plugin {
     }
     if(t.mode&&t.mode!=='page')throw new Error('模板模式无效');
     const title=text.match(/^# (.+)$/m)?.[1];if(!title)throw new Error('模板缺少页面标题');
-    let folder=normalizePath(file.parent.path+'/'+this.safeName(title)),i=2;while(this.app.vault.getAbstractFileByPath(folder))folder=normalizePath(file.parent.path+'/'+this.safeName(title)+' '+i++);
+    const directory = file.parent?.path ?? '';
+    let folder=normalizePath(directory+'/'+this.safeName(title)),i=2;while(this.app.vault.getAbstractFileByPath(folder))folder=normalizePath(directory+'/'+this.safeName(title)+' '+i++);
     await this.ensureFolder(folder);const path=folder+'/'+folder.split('/').pop()+'.md';await this.app.vault.create(path,text);
     await this.app.vault.process(file,body=>this.insertChildLink(body,'[['+path.slice(0,-3)+'|'+title+']]',file.path));
-    const parent=this.data?.nodes[file.path];this.data.nodes[path]={path,title,type:'page',children:[]};if(parent){parent.children??=[];parent.children.unshift(path);}await this.saveData(this.data);await this.open(path);this.refreshViews();
+    const parent=this.data.nodes[file.path];this.data.nodes[path]={path,title,type:'page',children:[]};if(parent){parent.children??=[];parent.children.unshift(path);}await this.saveData(this.data);await this.open(path);this.refreshViews();
   }
 };
