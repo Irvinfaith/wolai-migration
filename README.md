@@ -58,12 +58,22 @@ wolai 和 Obsidian 的页面组织方式不同，搬家时最费工的是重搭�
 | 页面卡片、分栏、折叠、普通表格 | 在阅读视图中呈现，包括表格合并单元格和图片位置 |
 | 图片、视频、文档和 Excel | 保存 ZIP 中提供的附件，Excel 可在阅读视图预览 |
 | 页面和块引用 | 导出包里有目标时生成 Obsidian 内链。目标缺失时保留 wolai 原地址，并列在迁移报告里 |
-| 多维表格 | HTML 只包含原表链接时保留入口。另选含记录的补充包，可生成原生 Bases |
+| 多维表格 | HTML 只包含原表链接时保留入口。有对应的 CSV、Excel 或数据库补充包时，可生成原生 Bases |
 
 <details>
 <summary>如何导入多维表格到原生 Bases？</summary>
 
-在命令面板执行「导入 wolai HTML ZIP 和数据库补充包」，依次选择原始 HTML ZIP 和补充包。要查看生成的 `.base` 文件，请在 Obsidian 启用 **Bases** 核心插件。
+如果你手上有原表的数据文件，可把它和从 wolai 导出的 HTML ZIP 一起迁移。请在 Obsidian 启用 **Bases** 核心插件，以查看原生 `.base` 表格。
+
+1. 用 `⌘P` 或 `Ctrl+P` 打开命令面板，执行 **「导入 wolai HTML ZIP 和 CSV / Excel 表格」**，选择原始 HTML ZIP。
+2. 从识别出的多维表格入口中选择一项。窗口会显示入口所在页面和 wolai 原链接，便于确认是哪张表。选择对应的 `.csv` 或 `.xlsx`，Excel 可选择工作表。确认表名后点击 **「添加表格」**。
+3. 有其他表格时可重复第 2 步。点 **「开始导入」** 后，对应入口会显示为原生 Base，每条记录保存成一篇笔记。没有表格数据时点 **「只导入页面」**，原表链接保留。迁移报告会列出实际使用的表格文件。
+
+文件以首个非空行为表头，首列用于给记录笔记命名，单元格按文本导入。Excel 公式使用文件中保存的结果，日期可能显示为 Excel 序号。每个文件最大 16 MiB、256 列，每批最多 10,000 条记录、500,000 个单元格。
+
+需要迁移正文中的行引用时，在表格里加一列 **`Wolai 原记录链接`**，把每条记录的原链接作为单元格内容。插件只按唯一且可匹配的原始 ID 生成内链，目标缺失或有歧义时保留原地址。表格文件只提供字段值，原记录正文、附件及原有视图需要另外提供。
+
+**已有完整数据库补充包？** 在命令面板执行「导入 wolai HTML ZIP 和数据库补充包」，依次选择原始 HTML ZIP 和补充包。
 
 如果你以前用 wolai-local 保存过数据库，可以按 [贡献指南](CONTRIBUTING.md#制作可选的-bases-补充包) 生成本地补充包。它只提供匹配的数据库、记录、记录附件和封面。补充包可能包含私人笔记，请保存在本机。
 
@@ -80,7 +90,7 @@ ZIP 上限为 768 MiB，解压总量上限为 1 GiB，单个条目上限为 256 
 
 ## 隐私与反馈
 
-插件在本机处理选中的 ZIP，结果写入当前笔记库。页面导航和 Wolai 阅读样式只应用于插件管理的导入批次。外链图片与封面可以向导出文件记载的地址发起请求，点击保留的网页链接也会打开对应站点。
+插件在本机处理选中的 ZIP 和表格文件，结果写入当前笔记库。页面导航和 Wolai 阅读样式只应用于插件管理的导入批次。外链图片与封面可以向导出文件记载的地址发起请求，点击保留的网页链接也会打开对应站点。
 
 遇到问题可提交 [Issue](../../issues/new/choose)。请附插件版本、Obsidian 版本、操作步骤和已脱敏的最小样例。安全问题使用[私密报告渠道](SECURITY.md)。
 
@@ -98,7 +108,7 @@ On Obsidian Desktop 1.15.1 or later, open **Settings → Community plugins → B
 
 Export your notes from Wolai as HTML and keep the ZIP. Close the plugin browser and Settings to return to your vault. Press **Cmd+P** on macOS or **Ctrl+P** on Windows and Linux, then run **Wolai Migration: 导入 wolai HTML ZIP**. The download icon on the left ribbon opens the same dialog. Drop or select the export ZIP to start importing. Obsidian opens the migrated root note and shows its child pages on the left. See the [illustrated walkthrough](#三步迁移) for the screens and `_wolai/迁移报告.md` in the new folder for the migration report.
 
-A Wolai link keeps its original address when the export does not contain the target. Native Bases require an explicitly selected database supplement.
+A Wolai link keeps its original address when there is no verified local target. If the HTML ZIP only includes a database link, run **导入 wolai HTML ZIP 和 CSV / Excel 表格** to match a CSV or Excel worksheet to the database and import its records into a native Base. An optional `Wolai 原记录链接` column links imported records by their original IDs.
 
 Build and test locally with `npm ci`, `npm test`, and `npm run build`. See [Contributing](CONTRIBUTING.md) for fixtures and releases.
 

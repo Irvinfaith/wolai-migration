@@ -1,10 +1,16 @@
 import { App, Modal, Notice } from "obsidian";
 import { ImportCancelledError } from "./core/archive";
+import type { DatabaseReference } from "./core/database-supplement";
+import type { TabularAssignment } from "./core/tabular-supplement";
 import { isDomNode } from "./core/validation";
+import { pickTableFiles } from "./table-picker";
+
+export type ImportMode = "archive" | "supplement" | "tables";
 
 export interface ImportRequest {
   archive: File;
   supplement?: File;
+  selectTableFiles?: (references: DatabaseReference[]) => Promise<TabularAssignment[]>;
   signal: AbortSignal;
 }
 
@@ -29,7 +35,7 @@ export class ImportModal extends Modal {
 
   constructor(
     app: App,
-    private readonly withSupplement: boolean,
+    private readonly mode: ImportMode,
     private readonly importZip: (request: ImportRequest, update: (progress: ImportProgress) => void) => Promise<void>,
     private readonly onDismiss: () => void,
   ) {
@@ -76,7 +82,7 @@ export class ImportModal extends Modal {
 
   private resetPicker() {
     this.pickLabel.setText("拖入 ZIP 或选择文件");
-    this.hint.setText(this.withSupplement ? "先选择 wolai 的 HTML 导出 ZIP" : "wolai → 导出 → HTML · 选择后自动导入");
+    this.hint.setText(this.mode === "archive" ? "wolai → 导出 → HTML · 选择后自动导入" : "先选择 wolai 的 HTML 导出 ZIP");
     this.pickButton.disabled = false;
     this.progress.hidden = true;
     this.cancelActions.hidden = true;
@@ -113,7 +119,7 @@ export class ImportModal extends Modal {
       this.status.setText("请选择一个 ZIP 文件。");
       return;
     }
-    if (this.withSupplement && !this.archive) {
+    if (this.mode === "supplement" && !this.archive) {
       this.archive = file;
       this.pickLabel.setText("拖入或选择数据库补充包 ZIP");
       this.hint.setText(`已选 HTML 导出包 · ${file.name}`);
@@ -132,7 +138,9 @@ export class ImportModal extends Modal {
     this.progress.value = 0;
 
     try {
-      await this.importZip({ archive: this.archive ?? file, supplement: this.archive ? file : undefined, signal: controller.signal }, (progress) => {
+      const request: ImportRequest = { archive: this.archive ?? file, supplement: this.archive ? file : undefined, signal: controller.signal };
+      if (this.mode === "tables") request.selectTableFiles = (references) => this.selectTables(references, controller.signal);
+      await this.importZip(request, (progress) => {
         this.progress.value = progress.value;
         if (!controller.signal.aborted) this.status.setText(progress.label);
         if (progress.committing) {
@@ -151,6 +159,21 @@ export class ImportModal extends Modal {
       this.committing = false;
       this.archive = undefined;
       if (this.contentEl.isConnected) this.resetPicker();
+    }
+  }
+
+  private async selectTables(references: DatabaseReference[], signal: AbortSignal) {
+    this.progress.hidden = true;
+    this.pickButton.hidden = true;
+    this.status.empty();
+    const panel = this.contentEl.createDiv({ cls: "wolai-table-picker" });
+    this.cancelActions.before(panel);
+    try {
+      return await pickTableFiles(panel, references, signal);
+    } finally {
+      panel.remove();
+      this.pickButton.hidden = false;
+      this.progress.hidden = false;
     }
   }
 }

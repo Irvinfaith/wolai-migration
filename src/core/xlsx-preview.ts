@@ -66,11 +66,12 @@ export function openWorkbook(bytes: Uint8Array, parseXml: (xml: string) => Docum
     .map((text) => text.textContent ?? "").join("");
   const shared = archive["xl/sharedStrings.xml"]
     ? elements(readXml("xl/sharedStrings.xml"), "si").map(richText) : [];
-  const cache = new Map<number, PreviewSheet>();
+  const cache = new Map<string, PreviewSheet>();
   return {
     sheets: sheets.map(({ name }) => name),
-    readSheet(index: number): PreviewSheet {
-      const previous = cache.get(index);
+    readSheet(index: number, columnLimit = maxPreviewColumns): PreviewSheet {
+      const key = `${index}:${columnLimit}`;
+      const previous = cache.get(key);
       if (previous) return previous;
       const sheet = sheets[index];
       if (!sheet) throw new Error("工作表不存在");
@@ -90,7 +91,7 @@ export function openWorkbook(bytes: Uint8Array, parseXml: (xml: string) => Docum
             : type === "inlineStr" ? richText(cell)
             : type === "b" && raw ? (raw === "1" ? "TRUE" : "FALSE") : raw;
           if (!value) continue;
-          if (column > maxPreviewColumns) {
+          if (column > columnLimit) {
             truncatedColumns = true;
             continue;
           }
@@ -100,7 +101,7 @@ export function openWorkbook(bytes: Uint8Array, parseXml: (xml: string) => Docum
         return { number: Number(row.getAttribute("r")) || position + 1, cells };
       }).filter(({ cells }) => cells.size);
       const result = { rows, columns, truncatedColumns };
-      cache.set(index, result);
+      cache.set(key, result);
       return result;
     },
   };

@@ -6,6 +6,7 @@ await build({
     "src/core/import-index.ts",
     "src/core/xlsx-preview.ts",
     "src/core/database-supplement.ts",
+    "src/core/tabular-supplement.ts",
     "src/core/block-data.ts",
   ],
   bundle: true,

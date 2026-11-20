@@ -1,9 +1,10 @@
 import { Notice, parseYaml, stringifyYaml } from "obsidian";
 import { checkZipSize, ImportCancelledError, readZip } from "./core/archive";
 import { readDatabaseSupplement } from "./core/database-supplement";
-import { convertArchive, writeConverted, type ConvertResult } from "./core/importer";
+import { convertPreparedArchive, listDatabaseReferences, prepareArchive, writeConverted, type ConvertResult } from "./core/importer";
 import type { ConvertedIndex } from "./core/import-index";
-import { ImportModal, type ImportRequest, type ImportProgress } from "./import-modal";
+import { createTabularSupplement } from "./core/tabular-supplement";
+import { ImportModal, type ImportMode, type ImportRequest, type ImportProgress } from "./import-modal";
 import { RendererPlugin } from "./renderer";
 
 export default class WolaiMigrationPlugin extends RendererPlugin {
@@ -20,7 +21,12 @@ export default class WolaiMigrationPlugin extends RendererPlugin {
     this.addCommand({
       id: "import-with-bases",
       name: "导入 wolai HTML ZIP 和数据库补充包",
-      callback: () => this.openImport(true),
+      callback: () => this.openImport("supplement"),
+    });
+    this.addCommand({
+      id: "import-with-table-files",
+      name: "导入 wolai HTML ZIP 和 CSV / Excel 表格",
+      callback: () => this.openImport("tables"),
     });
   }
 
@@ -29,13 +35,13 @@ export default class WolaiMigrationPlugin extends RendererPlugin {
     super.onunload();
   }
 
-  openImport(withSupplement = false) {
+  openImport(mode: ImportMode = "archive") {
     if (this.activeImport) {
       new Notice("正在导入，请等待本次导入结束");
       return;
     }
     this.importModal?.close();
-    const modal = new ImportModal(this.app, withSupplement, (request, update) => this.importZip(request, update), () => {
+    const modal = new ImportModal(this.app, mode, (request, update) => this.importZip(request, update), () => {
       if (this.importModal === modal) this.importModal = undefined;
     });
     this.importModal = modal;
@@ -56,18 +62,29 @@ export default class WolaiMigrationPlugin extends RendererPlugin {
       checkCancelled();
       update({ label: "正在解压 ZIP…", value: 15 });
       const archive = await readZip(bytes, request.signal);
-      const databaseSupplement = request.supplement
+      let databaseSupplement = request.supplement
         ? readDatabaseSupplement(new Uint8Array(await request.supplement.arrayBuffer()), parseYaml, stringifyYaml)
         : undefined;
       checkCancelled();
       update({ label: "正在解析页面…", value: 30 });
+      const isCancelled = () => request.signal.aborted;
+      const prepared = prepareArchive(archive, {
+        parseHTML: (html) => new DOMParser().parseFromString(html, "text/html"),
+        isCancelled,
+      });
+      if (request.selectTableFiles) {
+        const references = listDatabaseReferences(prepared, isCancelled);
+        const assignments = await request.selectTableFiles(references);
+        checkCancelled();
+        if (assignments.length) databaseSupplement = createTabularSupplement(assignments, references, parseYaml, stringifyYaml);
+        update({ label: "正在转换页面和已选表格…", value: 35 });
+      }
       const vault = this.app.vault;
       const existingNames = new Set(vault.getRoot().children.map((file) => file.name.normalize("NFC").toLowerCase()));
-      const result = convertArchive(archive, {
-        parseHTML: (html: string) => new DOMParser().parseFromString(html, "text/html"),
+      const result = convertPreparedArchive(prepared, {
         databaseSupplement,
         isTargetOccupied: (path) => existingNames.has(path.normalize("NFC").toLowerCase()),
-        isCancelled: () => request.signal.aborted,
+        isCancelled,
       });
       await this.writeImport(result, request.signal, update);
     } finally {
@@ -110,6 +127,7 @@ export default class WolaiMigrationPlugin extends RendererPlugin {
       console.error("[wolai-migration] 无法打开导入结果", error);
     }
     const references = result.stats.externalLinks ? ` · ${result.stats.externalLinks} 处原链接，见迁移报告` : "";
-    new Notice(`已导入 ${result.stats.pages} 篇页面到「${rootFolder}」${references}`, 8000);
+    const tables = result.stats.databases ? ` · ${result.stats.databases} 张表、${result.stats.records} 条记录` : "";
+    new Notice(`已导入 ${result.stats.pages} 篇页面到「${rootFolder}」${tables}${references}`, 8000);
   }
 }

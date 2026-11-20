@@ -9,6 +9,13 @@ export interface DatabaseSource {
   schema: { name: string; type: string }[];
   records: { path: string; title: string; sourceId?: string }[];
   attachments: string[];
+  tableFile?: string;
+}
+
+export interface DatabaseReference {
+  id: string;
+  url: string;
+  pageTitle: string;
 }
 
 export interface DatabaseSupplement {

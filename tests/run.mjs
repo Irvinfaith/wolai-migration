@@ -4,9 +4,10 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { strToU8, zipSync } from 'fflate';
 import { DOMParser } from 'linkedom';
-import { convertExport, ImportCancelledError, writeConverted } from '../dist/importer.mjs';
+import { convertExport, convertPreparedArchive, ImportCancelledError, listDatabaseReferences, prepareArchive, writeConverted } from '../dist/importer.mjs';
 import { columnLabel, openWorkbook } from '../dist/xlsx-preview.mjs';
 import { readDatabaseSupplement } from '../dist/database-supplement.mjs';
+import { createTabularSupplement, openTabularFile } from '../dist/tabular-supplement.mjs';
 import { readZip, readZipSync } from '../dist/archive.mjs';
 import { readImportIndex, restrictIndexToImports } from '../dist/import-index.mjs';
 import { readColumns, readDatabaseForm, readImage, readProgress, readTable, readTemplate } from '../dist/block-data.mjs';
@@ -143,6 +144,90 @@ test('reads Excel sheet names, cached results and sparse column addresses', () =
   assert.equal(sheet.rows[0].cells.get(4), '7');
   assert.equal(sheet.rows[0].cells.get(53), '备考');
   assert.equal(columnLabel(53), 'BA');
+});
+
+test('reads CSV delimiters, BOMs, quoted values and rejects malformed input', () => {
+  const csv = openTabularFile('采购.csv', strToU8('\ufeffsep=;\r\n编号;备注;空值\r\n001;"一;二\r\n""原样""";\r\n'), parseXml);
+  assert.deepEqual(csv.readSheet(0), [['编号', '备注', '空值'], ['001', '一;二\r\n"原样"', '']]);
+  const utf16 = Buffer.from('\ufeff列名\r\n记录', 'utf16le');
+  assert.deepEqual(openTabularFile('表.csv', utf16, parseXml).readSheet(0), [['列名'], ['记录']]);
+  assert.throws(() => openTabularFile('错.csv', strToU8('列\n"未闭合'), parseXml), /未闭合/);
+  assert.throws(() => openTabularFile('错.csv', strToU8('列\n"关闭"再加内容'), parseXml), /引号格式/);
+  assert.throws(() => openTabularFile('空.csv', strToU8('列\n\n'), parseXml), /至少一行/);
+});
+
+test('reads the selected worksheet without the attachment preview column limit', () => {
+  const bytes = zipSync({
+    'xl/workbook.xml': strToU8('<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="目录" r:id="r1"/><sheet name="明细" r:id="r2"/></sheets></workbook>'),
+    'xl/_rels/workbook.xml.rels': strToU8('<Relationships><Relationship Id="r1" Type="test/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="r2" Type="test/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'),
+    'xl/worksheets/sheet1.xml': strToU8('<worksheet><sheetData/></worksheet>'),
+    'xl/worksheets/sheet2.xml': strToU8('<worksheet><sheetData><row><c r="A1" t="inlineStr"><is><t>名称</t></is></c><c r="CA1" t="inlineStr"><is><t>远端列</t></is></c></row><row><c r="A2" t="inlineStr"><is><t>桌子</t></is></c><c r="CA2"><f>3+4</f><v>7</v></c></row></sheetData></worksheet>'),
+  });
+  const xlsx = openTabularFile('备货.xlsx', bytes, parseXml);
+  assert.deepEqual(xlsx.sheets, ['目录', '明细']);
+  assert.throws(() => xlsx.readSheet(0), /至少一行/);
+  const rows = xlsx.readSheet(1);
+  assert.equal(rows[0].at(-1), '远端列');
+  assert.equal(rows[1].at(-1), '7');
+  assert.equal(rows[1][0], '桌子');
+  assert.equal(openWorkbook(bytes, parseXml).readSheet(1).truncatedColumns, true);
+});
+
+test('builds Bases from supplied table rows and resolves only unambiguous source IDs', () => {
+  const archive = prepareArchive({
+    'RootId/采购.html': strToU8(`<article>
+      <p id="WordId">实际存在的块</p>
+      <p><a href="https://www.wolai.com/Table1#Record1">已有记录</a>
+      <a href="https://www.wolai.com/Record1#Record1">同一条</a>
+      <a href="https://www.wolai.com/Table2#Record1">不同表</a>
+      <a href="https://www.wolai.com/Record2">同名也缺失</a>
+      <a href="https://www.wolai.com/RepeatId">重复 ID</a>
+      <a href="https://www.wolai.com/WordId#WordId">原块</a></p>
+      <div class="wolai-block wolai-text" id="Table1"><div><a href="https://www.wolai.com/Table1">无标题数据表格</a></div></div>
+      <div class="wolai-block wolai-text"><div><a href="https://www.wolai.com/Table1#Table1">无标题数据表格</a></div></div>
+      <div class="wolai-block wolai-text"><div><a href="https://www.wolai.com/RootId#Table2">无标题数据表格</a></div></div>
+    </article>`),
+  }, { parseHTML });
+  const references = listDatabaseReferences(archive);
+  assert.deepEqual(references.map(({ id, pageTitle }) => [id, pageTitle]), [['Table1', '采购'], ['Table2', '采购']]);
+  const rows = [
+    ['名称', '编号', '编号', 'tags', 'Wolai 原记录链接'],
+    ['台灯', '001', 'ON', '[旧]', 'https://www.wolai.com/Table1#Record1'],
+    ['台灯', '002', 'OFF'],
+    ['窗帘', '003', '', '', 'https://www.wolai.com/RepeatId'],
+    ['书柜', '004', '', '', 'https://www.wolai.com/RepeatId'],
+    ['卡片', '005', '', '', 'https://www.wolai.com/WordId#WordId'],
+  ];
+  const databaseSupplement = createTabularSupplement([
+    { source: references[0], title: '灯具表', fileName: '灯具.csv', rows },
+  ], references, JSON.parse, JSON.stringify);
+  const result = convertPreparedArchive(archive, { databaseSupplement });
+  const files = new Map(result.files.map(({ path, data }) => [path, data]));
+  const body = files.get(result.rootPath);
+  const base = Object.values(result.index.nodes).find(({ type }) => type === 'database');
+  const first = base.children[0];
+  assert.equal(base.children.length, rows.length - 1);
+  assert.match(base.children[1], /台灯 2\.md$/);
+  assert.equal(result.stats.recordLinks, 2);
+  assert(body.includes(`[[${first.slice(0, -3)}|已有记录]]`));
+  assert(body.includes(`[[${first.slice(0, -3)}|同一条]]`));
+  assert(body.includes(`![[${base.path}]]`));
+  assert(body.includes('https://www.wolai.com/Table2#Record1'));
+  assert(body.includes('https://www.wolai.com/Record2'));
+  assert(body.includes('https://www.wolai.com/RepeatId'));
+  assert(body.includes('#^w-WordId|原块'));
+  assert(body.includes('wolai-table-source'));
+  const [properties, recordBody] = files.get(first).split('---\n').slice(1);
+  assert.equal(recordBody, '');
+  assert.deepEqual(JSON.parse(properties), {
+    '名称': '台灯', '编号': '001', '编号 2': 'ON', 'tags 2': '[旧]', 'Wolai 原记录链接': 'https://www.wolai.com/Table1#Record1',
+    _wolai_database: 'Table1', _wolai_order: 1,
+  });
+  const { views, filters } = JSON.parse(files.get(base.path));
+  assert.deepEqual(views[0].order, ['file.name', 'note.名称', 'note.编号', 'note.编号 2', 'note.tags 2', 'note.Wolai 原记录链接']);
+  assert.deepEqual(views[0].sort, [{ property: 'note._wolai_order', direction: 'ASC' }]);
+  assert(filters.and.includes(`file.inFolder("${base.recordsFolder}")`));
+  assert.match(files.get('采购/_wolai/迁移报告.md'), /灯具\.csv/);
 });
 
 test('restores a native Base, scoped views, linked record notes and their attachments by source ID', () => {
@@ -381,7 +466,10 @@ test('a write conflict or failed index commit leaves prior content intact', asyn
 });
 
 test('checks conversion and link targets in a real export when supplied', { skip: !process.env.WOLAI_ZIP }, () => {
-  const result = convertExport(readFileSync(process.env.WOLAI_ZIP), { parseHTML });
+  const archive = prepareArchive(readZipSync(readFileSync(process.env.WOLAI_ZIP)), { parseHTML });
+  const references = listDatabaseReferences(archive);
+  if (process.env.WOLAI_EXPECT_TABLES) assert.equal(references.length, Number(process.env.WOLAI_EXPECT_TABLES));
+  const result = convertPreparedArchive(archive, {});
   const paths = new Set(result.files.map(({ path }) => path));
   assert(result.stats.pages > 0);
   assert(paths.has(result.rootPath));

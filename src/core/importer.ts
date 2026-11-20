@@ -5,7 +5,7 @@ import type { ConvertedIndex, IndexNode, PageIcon, PageSettings } from "./import
 import type { TableCell } from "./block-data";
 import { errorMessage, isRecord } from "./validation";
 import { cleanFileName } from "./file-name";
-import { databaseSourceIds, readBaseConfig, type DatabaseSource, type DatabaseSupplement } from "./database-supplement";
+import { databaseSourceIds, readBaseConfig, type DatabaseReference, type DatabaseSource, type DatabaseSupplement } from "./database-supplement";
 
 export interface ConvertOptions {
   targetRoot?: string;
@@ -217,7 +217,7 @@ interface Ctx {
   pages: Record<string, Page>;
   pageid: Map<string, string>;
   block2page: Map<string, string | null>;
-  options: ConvertOptions;
+  options: Omit<ConvertOptions, "parseHTML">;
   databases: Map<string, ImportedDatabase>;
   recordsBySource: Map<string, ImportedRecord | null>;
   requestedAnchors: Set<string>;
@@ -651,6 +651,11 @@ function findReferencedDatabases(pages: Record<string, Page>, supplement?: Datab
       const ids = databaseSourceIds(attr(anchor, "href") ?? "");
       if (!ids.length) continue;
       const [id, fragment] = ids;
+      const linkedTable = supplement.databases.get(fragment || id);
+      if (linkedTable?.tableFile && isDatabaseSourceAnchor(anchor)) {
+        if (!databases.has(linkedTable.id)) register(linkedTable, page);
+        continue;
+      }
       const nested = rowOwners.get(fragment);
       const rowOwner = rowOwners.get(id) || (nested?.id === id ? nested : undefined);
       if (rowOwner) {
@@ -658,11 +663,11 @@ function findReferencedDatabases(pages: Record<string, Page>, supplement?: Datab
         continue;
       }
       const source = ids.map((sourceId) => supplement.databases.get(sourceId)).find(Boolean);
-      if (source && !databases.has(source.id)) register(source, page);
+      if (source && !source.tableFile && !databases.has(source.id)) register(source, page);
     }
   }
   for (const [source, owner] of rowReferences) {
-    if (!databases.has(source.id)) register(source, owner);
+    if (!source.tableFile && !databases.has(source.id)) register(source, owner);
   }
   return databases;
 }
@@ -705,15 +710,16 @@ function writeDatabaseFiles(ctx: Ctx, index: ConvertedIndex, output: Map<string,
       const yaml = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown)?.[1];
       const properties = yaml ? supplement.parseYaml(yaml) : null;
       if (!isRecord(properties) || properties._wolai_database !== source.id) throw new Error(`数据库记录归属无法核验：${source.title} / ${record.title}`);
-      const rebased = markdown.replace(/(\[\[)([^\]\n|#]+)(?=[\]|#])/g, (whole: string, open: string, link: string) => {
+      const rebased = source.tableFile ? markdown : markdown.replace(/(\[\[)([^\]\n|#]+)(?=[\]|#])/g, (whole: string, open: string, link: string) => {
         const local = links.get(link) ?? sharedLinks.get(link);
         return local ? open + local : whole;
       });
       output.set(destination, rebased);
       recordPaths.push(destination);
-      if (record.sourceId) {
-        const match = ctx.recordsBySource.has(record.sourceId) ? null : { path: destination, databaseId: source.id };
-        ctx.recordsBySource.set(record.sourceId, match);
+      const sourceId = record.sourceId;
+      if (sourceId && (!source.tableFile || (!ctx.pageid.has(sourceId) && !ctx.block2page.has(sourceId)))) {
+        const match = ctx.recordsBySource.has(sourceId) ? null : { path: destination, databaseId: source.id };
+        ctx.recordsBySource.set(sourceId, match);
       }
       index.nodes[destination] = { path: destination, title: record.title, sourceId: record.sourceId, type: "record", databasePath: path, children: [] };
     }
@@ -788,11 +794,12 @@ function convertImage(el: Element, ctx: Ctx, page: Page): string | null {
 
 // ---------------------------------------------------------------- pages
 
-function loadPages(files: Record<string, Uint8Array>, htmlKeys: string[], rootKey: string, parseHTML: ConvertOptions["parseHTML"]): Record<string, Page> {
+function loadPages(files: Record<string, Uint8Array>, htmlKeys: string[], rootKey: string, parseHTML: ConvertOptions["parseHTML"], isCancelled?: () => boolean): Record<string, Page> {
   const pages: Record<string, Page> = {};
   const decoder = new TextDecoder("utf-8");
   for (const key of htmlKeys) {
     if (!key.startsWith(rootKey + "/")) continue;
+    if (isCancelled?.()) throw new ImportCancelledError();
     const rel = posixNormalize(key.slice(rootKey.length));
     const html = decoder.decode(files[key]);
     const doc = parseHTML(html);
@@ -926,7 +933,10 @@ export function convertExport(zip: Uint8Array, options: ConvertOptions): Convert
 }
 
 export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertResult {
-  const supplement = options.databaseSupplement;
+  return convertPreparedArchive(prepareArchive(raw, options), options);
+}
+
+export function prepareArchive(raw: Unzipped, options: Pick<ConvertOptions, "parseHTML" | "isCancelled">) {
   const files: Record<string, Uint8Array> = {};
   for (const k of Object.keys(raw)) {
     const key = posixNormalize(k);
@@ -942,9 +952,34 @@ export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertR
   let rootKey = tops.find((t) => Object.keys(files).some((k) => k.startsWith(t + "/css/"))) || tops[0];
   if (tops.length === 1) rootKey = tops[0];
 
-  const pages = loadPages(files, htmlKeys, rootKey, options.parseHTML);
+  const pages = loadPages(files, htmlKeys, rootKey, options.parseHTML, options.isCancelled);
   const rootRel = Object.keys(pages).find((r) => !r.includes("/"));
   if (!rootRel) throw new Error("没有找到根页面 HTML");
+  return { files, pages, rootKey, rootRel };
+}
+
+function isDatabaseSourceAnchor(anchor: Element): boolean {
+  return textOf(anchor).trim() === "无标题数据表格";
+}
+
+export function listDatabaseReferences(archive: ReturnType<typeof prepareArchive>, isCancelled?: () => boolean): DatabaseReference[] {
+  const references = new Map<string, DatabaseReference>();
+  for (const page of Object.values(archive.pages)) {
+    if (isCancelled?.()) throw new ImportCancelledError();
+    for (const anchor of findAll(page.article, "a[href]")) {
+      if (!isDatabaseSourceAnchor(anchor)) continue;
+      const url = attr(anchor, "href") ?? "";
+      const [pageId, blockId] = databaseSourceIds(url);
+      const id = blockId || pageId;
+      if (id && !references.has(id)) references.set(id, { id, url, pageTitle: page.title });
+    }
+  }
+  return [...references.values()];
+}
+
+export function convertPreparedArchive(archive: ReturnType<typeof prepareArchive>, options: Omit<ConvertOptions, "parseHTML">): ConvertResult {
+  const { files, pages, rootKey, rootRel } = archive;
+  const supplement = options.databaseSupplement;
   const rootTitle = pages[rootRel].title;
   const preferredFolder = safeFileName(options.targetRoot || rootTitle);
   if (options.targetRoot && preferredFolder.startsWith(".")) throw new Error("目标目录不能以点号开头");
@@ -1060,7 +1095,8 @@ export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertR
   report.push("# Wolai 导入报告\n");
   report.push("- 页面：" + stats.pages + " 个");
   report.push("- 资源：" + stats.assets + " 个");
-  if (stats.databases) report.push(`- 原生 Bases：${stats.databases} 张，记录笔记 ${stats.records} 篇（来自所选的数据补充包）`);
+  const importedTables = [...databases.values()].filter(({ source }) => source.tableFile);
+  if (stats.databases) report.push(`- 原生 Bases：${stats.databases} 张，记录笔记 ${stats.records} 篇（来自所选的${importedTables.length ? "表格文件" : "数据补充包"}）`);
   if (stats.recordLinks) report.push(`- 已转为 Obsidian 内链的数据库记录引用：${stats.recordLinks} 处`);
   if (stats.cachedCovers) report.push(`- 本地封面：${stats.cachedCovers} 张（按源页面 ID 恢复）`);
   report.push("- 数据块：" + stats.blocks + " 个（含嵌套）");
@@ -1073,6 +1109,14 @@ export function convertArchive(raw: Unzipped, options: ConvertOptions): ConvertR
   report.push("- 分栏 → `wolai-columns`；表格 → `wolai-table`；彩色块 → `wolai-styled`。");
   report.push("- 折叠块保留展开状态及内容层级，图片保留对齐、宽度和图注。原始附件在各自 `media/`。");
   report.push("");
+  if (importedTables.length) {
+    report.push("## 补充导入的表格\n");
+    for (const { source, path } of importedTables) {
+      const fileName = htmlEscape(source.tableFile?.replace(/\s+/g, " ") ?? "");
+      report.push(`- [[${path}|${safeLabel(source.title)}]] · ${source.records.length} 条 · <code>${fileName}</code> · <https://www.wolai.com/${source.id}>`);
+    }
+    report.push("");
+  }
   if (ctx.unresolvedLinks.size) {
     const descriptions: Record<UnresolvedLink["reason"], string> = {
       target: "页面或记录未随导出提供",
