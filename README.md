@@ -64,9 +64,17 @@ ZIP 上限为 768 MiB，解压总量上限为 1 GiB，单个条目上限为 256 
 
 ## English summary
 
-Move your Wolai notes to Obsidian in one step after export. Choose **导入 wolai HTML ZIP** in the command palette or click the download icon, then drop or select your Wolai HTML ZIP. Import starts immediately. See `_wolai/迁移报告.md` in the new folder for the migration report.
+Move your Wolai notes to Obsidian in one step after export. The importer preserves local pages, attachments, and resolvable links.
 
-This release targets Obsidian Desktop 1.15.1 or later. The importer preserves local pages, attachments, and resolvable links. A Wolai link keeps its original address when the export does not contain the target. Native Bases require an explicitly selected database supplement.
+### Installation
+
+On Obsidian Desktop 1.15.1 or later, download the installation ZIP from [GitHub Releases](../../releases/latest). Extract the `wolai-migration` folder into `.obsidian/plugins/` inside your vault, then enable **Wolai Migration** in **Settings → Community plugins**.
+
+### Usage
+
+Export your notes from Wolai as HTML. In Obsidian, choose **导入 wolai HTML ZIP** in the command palette or click the download icon, then drop or select the export ZIP. Import starts immediately. See `_wolai/迁移报告.md` in the new folder for the migration report.
+
+A Wolai link keeps its original address when the export does not contain the target. Native Bases require an explicitly selected database supplement.
 
 Build and test locally with `npm ci`, `npm test`, and `npm run build`. See [Contributing](CONTRIBUTING.md) for fixtures and releases.
 
